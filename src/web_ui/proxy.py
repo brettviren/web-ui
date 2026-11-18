@@ -45,9 +45,10 @@ from web_ui.names import (
     split_host_header,
 )
 from web_ui.peercred import peer_uid
-from web_ui.runner import get_runner
+from web_ui.runner import RunnerError, get_runner
 
 log = logging.getLogger(__name__)
+access_log = logging.getLogger("web_ui.access")
 
 MAX_HEAD = 64 * 1024
 HEAD_TIMEOUT = 30.0
@@ -109,6 +110,29 @@ class Request:
         lines = [f"{self.method} {self.target} {self.version}"]
         lines += [f"{k}: {v}" for k, v in self.headers]
         return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
+
+
+@dataclass
+class Access:
+    """What the access log says about one connection."""
+
+    kind: str  # "unix" (front socket) or "tcp" (loopback port)
+    t0: float = field(default_factory=time.monotonic)
+    req: Request | None = None
+    status: int | None = None
+    nbytes: int = 0
+    backend: str = "-"
+    note: str = ""
+
+    def line(self) -> str:
+        if self.req is None:
+            what = "- -"
+        else:
+            host = next((v for k, v in self.req.headers if k.lower() == "host"), "-")
+            what = f"{self.req.method} http://{host}{self.req.target}"
+        status = self.status if self.status is not None else "-"
+        out = f"{self.kind} {what} {status} {self.nbytes} {time.monotonic() - self.t0:.3f}s {self.backend}"
+        return out + (f" ({self.note})" if self.note else "")
 
 
 def response(status: int, reason: str, body: str, ctype: str = "text/html; charset=utf-8") -> bytes:
@@ -188,7 +212,8 @@ class Proxy:
                         continue
                     raise RuntimeError(f"cannot listen on {addr}:{self.port}: {e.strerror}") from e
                 self.servers.append(srv)
-                log.info("listening on http://%s:%d (try http://localhost:%d/)", addr, self.port, self.port)
+                shown = f"[{addr}]" if ":" in addr else addr
+                log.info("listening on http://%s:%d (try http://localhost:%d/)", shown, self.port, self.port)
 
     async def close(self) -> None:
         for srv in self.servers:
@@ -199,13 +224,20 @@ class Proxy:
         self.servers.clear()
         if not instances.probe(("unix", str(self.cfg.front_socket))):
             self.cfg.front_socket.unlink(missing_ok=True)
+        log.info("stopped listening")
 
     async def serve_forever(self) -> None:
         await self.start()
         loop = asyncio.get_running_loop()
         stop = asyncio.Event()
+        def on_signal(sig: signal.Signals) -> None:
+            log.info("got %s, shutting down", sig.name)
+            stop.set()
+
         for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, stop.set)
+            loop.add_signal_handler(sig, on_signal, sig)
+        log.debug("serving %s as uid %d: autostart=%s check_uid=%s strict_origin=%s",
+                  self.cfg.hostname, self.uid, self.autostart, self.cfg.check_uid, self.cfg.strict_origin)  # fmt: skip
         try:
             await stop.wait()
         finally:
@@ -214,17 +246,23 @@ class Proxy:
     # ---- per connection -------------------------------------------------
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, kind: str) -> None:
+        acc = Access(kind)
         try:
-            await self._handle(reader, writer, kind)
+            await self._handle(reader, writer, acc)
         except HTTPError as e:
-            log.info("%s %s", e.status, e.message)
+            acc.status, acc.note = e.status, e.message
+            page_ = error_page(e)
+            acc.nbytes = len(page_)
             with contextlib.suppress(Exception):
-                writer.write(error_page(e))
+                writer.write(page_)
                 await writer.drain()
-        except (TimeoutError, ConnectionError, asyncio.IncompleteReadError):
-            pass
-        except Exception:
-            log.exception("error handling request")
+        except (TimeoutError, ConnectionError, asyncio.IncompleteReadError) as e:
+            # Without a request this is a liveness probe (or an idle client): not worth a line.
+            if acc.req is not None:
+                acc.note = f"connection ended: {type(e).__name__}"
+        except Exception as e:
+            log.exception("error handling %s", acc.line())
+            acc.status, acc.note = 500, f"proxy error: {e!r}"
             with contextlib.suppress(Exception):
                 writer.write(error_page(HTTPError(500, "Internal Server Error", "web-ui proxy error; see its log")))
                 await writer.drain()
@@ -232,18 +270,25 @@ class Proxy:
             with contextlib.suppress(Exception):
                 writer.close()
                 await writer.wait_closed()
+            if acc.req is not None or acc.status is not None:
+                access_log.info("%s", acc.line())
 
-    async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, kind: str) -> None:
-        if self.cfg.check_uid:
-            sock = writer.get_extra_info("socket")
-            uid = peer_uid(sock) if sock is not None else None
-            if uid != self.uid:
-                raise HTTPError(403, "Forbidden", f"connection from uid {uid}; this proxy serves uid {self.uid} only")
+    async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, acc: Access) -> None:
+        kind = acc.kind
         try:
             head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), HEAD_TIMEOUT)
         except asyncio.LimitOverrunError:
             raise HTTPError(431, "Request Header Fields Too Large", "request head too large")
         req = Request.parse(head)
+        acc.req = req
+        # Check the peer once it has sent a request: it is still connected, waiting
+        # for the reply, so its socket is surely still in /proc/net/tcp.
+        if self.cfg.check_uid:
+            sock = writer.get_extra_info("socket")
+            uid = peer_uid(sock) if sock is not None else None
+            log.debug("%s connection from uid %s", kind, uid)
+            if uid != self.uid:
+                raise HTTPError(403, "Forbidden", f"connection from uid {uid}; this proxy serves uid {self.uid} only")
         host_header = req.get("host")
         if not host_header:
             raise HTTPError(400, "Bad Request", "no Host header")
@@ -255,14 +300,19 @@ class Proxy:
         self.check_origin(req, host_header)
 
         remote = kind == "tcp" and target.host is not None and not self.cfg.is_self(target.host)
-        log.debug("%s %s %s -> %s", kind, req.method, host_header, target)
+        log.debug("%s %s %s%s -> %s", kind, req.method, host_header, req.target, target)
         if remote:
+            acc.backend = f"tunnel:{target.host}"
             breader, bwriter = await self.connect_remote(target.host)
         elif target.service is None:
-            writer.write(await self.landing(req, host_header, target.host or self.cfg.hostname))
+            acc.backend = "landing"
+            page_ = await self.landing(req, host_header, target.host or self.cfg.hostname)
+            acc.status, acc.nbytes = 200, len(page_)
+            writer.write(page_)
             await writer.drain()
             return
         else:
+            acc.backend = f"{target.service}/{target.instance}"
             breader, bwriter = await self.connect_local(target, req)
 
         if not req.is_upgrade:
@@ -270,7 +320,7 @@ class Proxy:
                 req.set(h, None)
             req.set("Connection", "close")
         bwriter.write(req.encode())
-        await self.splice(reader, writer, breader, bwriter)
+        await self.splice(reader, writer, breader, bwriter, acc)
 
     def check_origin(self, req: Request, host_header: str) -> None:
         """Refuse cross-origin state changes and WebSockets (CSRF, rebinding)."""
@@ -280,12 +330,15 @@ class Proxy:
             return
         origin = req.get("origin")
         if origin is None:
-            if req.is_upgrade or (req.get("sec-fetch-site") or "same-origin") in ("same-origin", "none"):
+            site = req.get("sec-fetch-site")
+            if req.is_upgrade or (site or "same-origin") in ("same-origin", "none"):
+                log.debug("no Origin, Sec-Fetch-Site %s: allowed", site)
                 return  # non-browser client, or a browser that says it is same-origin
-            raise HTTPError(403, "Forbidden", "cross-site request refused")
+            raise HTTPError(403, "Forbidden", f"cross-site request refused (Sec-Fetch-Site: {site})")
         parts = urlsplit(origin)
         if origin == "null" or parts.netloc.lower() != host_header.strip().lower():
             raise HTTPError(403, "Forbidden", f"cross-origin request from {origin} refused")
+        log.debug("Origin %s matches", origin)
 
     # ---- backends -------------------------------------------------------
 
@@ -295,6 +348,7 @@ class Proxy:
         assert svc_name
         svc = cfg.services.get(svc_name)
         ep = instances.endpoint(cfg, svc_name, name)
+        log.debug("%s/%s endpoint %s", svc_name, name, ep)
         if not instances.probe(ep):
             inst = instances.get(cfg, svc_name, name)
             if inst is None and svc and svc.singleton and name == DEFAULT_INSTANCE:
@@ -308,12 +362,15 @@ class Proxy:
                 raise HTTPError(502, "Bad Gateway", f"{svc_name} {name} is not running", f"web-ui up {svc_name} --name {name}")
             async with self.locks[f"{svc_name}/{name}"]:
                 if not instances.probe(instances.endpoint(cfg, svc_name, name)):
-                    log.info("starting %s %s", svc_name, name)
+                    log.debug("autostarting %s/%s", svc_name, name)
                     if instances.get(cfg, svc_name, name) is None:
                         instances.save(cfg, inst)
                     try:
                         await asyncio.to_thread(instances.start, cfg, inst)
+                    except (instances.StartError, RunnerError) as e:
+                        raise HTTPError(502, "Bad Gateway", f"could not start {svc_name} {name}: {e}")
                     except Exception as e:
+                        log.exception("starting %s %s", svc_name, name)
                         raise HTTPError(502, "Bad Gateway", f"could not start {svc_name} {name}: {e}")
             ep = instances.endpoint(cfg, svc_name, name)
         kind, addr = ep
@@ -323,6 +380,7 @@ class Proxy:
             else:
                 conn = await asyncio.open_connection(*addr)
         except OSError as e:
+            log.error("cannot connect to %s %s at %s: %s", svc_name, name, addr, e)
             raise HTTPError(502, "Bad Gateway", f"cannot connect to {svc_name} {name}: {e}")
         if svc and svc.rewrite_host:
             orig = req.get("host")
@@ -340,42 +398,59 @@ class Proxy:
                 raise HTTPError(502, "Bad Gateway", f"no tunnel to {host}", f"Run: web-ui tunnel {host}")
             async with self.locks[f"tunnel/{host}"]:
                 if not instances.probe(("unix", str(path))):
-                    log.info("starting tunnel to %s", host)
                     await asyncio.to_thread(self._start_tunnel, hcfg)
         try:
             return await asyncio.open_unix_connection(str(path))
         except OSError as e:
+            log.error("cannot connect to %s's tunnel at %s: %s", host, path, e)
             raise HTTPError(502, "Bad Gateway", f"cannot connect to {host}'s tunnel: {e}")
 
     def _start_tunnel(self, hcfg) -> None:
+        log.info("starting tunnel to %s (ssh %s)", hcfg.name, hcfg.ssh)
         runner = get_runner(self.cfg)
         unit = tunnel.unit_name(hcfg.name)
-        runner.start(tunnel.launch(self.cfg, hcfg))
+        t0 = time.monotonic()
+        try:
+            runner.start(tunnel.launch(self.cfg, hcfg))
+        except RunnerError as e:
+            raise HTTPError(502, "Bad Gateway", f"cannot start the tunnel to {hcfg.name}: {e}")
         path = str(self.cfg.host_socket(hcfg.name))
-        deadline = time.monotonic() + 30
+        deadline = t0 + 30
         while time.monotonic() < deadline:
             if instances.probe(("unix", path)):
+                log.info("tunnel to %s is up after %.1fs", hcfg.name, time.monotonic() - t0)
                 return
             if not runner.is_active(unit):
+                log.error("tunnel to %s exited; see: web-ui logs --tunnel %s", hcfg.name, hcfg.name)
                 break
             time.sleep(0.2)
+        else:
+            log.error("tunnel to %s did not come up within 30s", hcfg.name)
         raise HTTPError(502, "Bad Gateway", f"tunnel to {hcfg.name} did not come up",
                         f"Check: web-ui logs --tunnel {hcfg.name}")  # fmt: skip
 
     @staticmethod
-    async def splice(creader, cwriter, breader, bwriter) -> None:
-        async def pump(src: asyncio.StreamReader, dst: asyncio.StreamWriter) -> None:
+    async def splice(creader, cwriter, breader, bwriter, acc: Access | None = None) -> None:
+        acc = acc or Access("-")
+
+        async def pump(src: asyncio.StreamReader, dst: asyncio.StreamWriter, response: bool) -> None:
             try:
                 while data := await src.read(65536):
+                    if response:
+                        if acc.status is None:  # the status line is at the start of the first chunk
+                            parts = data[:32].split(b" ", 2)
+                            if len(parts) > 1 and parts[0].startswith(b"HTTP/") and parts[1].isdigit():
+                                acc.status = int(parts[1])
+                        acc.nbytes += len(data)
                     dst.write(data)
                     await dst.drain()
                 if dst.can_write_eof():
                     dst.write_eof()
-            except (ConnectionError, OSError):
-                pass
+            except (ConnectionError, OSError) as e:
+                log.debug("%s %s: %r", acc.backend, "response" if response else "request", e)
 
-        up = asyncio.create_task(pump(creader, bwriter))
-        down = asyncio.create_task(pump(breader, cwriter))
+        up = asyncio.create_task(pump(creader, bwriter, False))
+        down = asyncio.create_task(pump(breader, cwriter, True))
         try:
             await down  # the response is done when the backend closes
         finally:

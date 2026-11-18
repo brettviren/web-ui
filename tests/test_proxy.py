@@ -207,3 +207,30 @@ def test_unix_front_ignores_host_label(cfg, proxy, env):
     r = c.getresponse()
     assert r.status == 200
     assert json.loads(r.read())["headers"]["host"].startswith("u.echo.whatever")
+
+
+def test_access_log(env, cfg, proxy):
+    from web_ui import log
+
+    sink = env / "access.log"
+    log.setup("info", str(sink))
+    d = project(env)
+    instances.start(cfg, instances.Instance("echo", "projx", str(d)))
+    assert get(cfg, "projx.echo.here.localhost", "/hello?x=1")[0] == 200
+    assert get(cfg, "evil.example")[0] == 421
+    conn = http.client.HTTPConnection("127.0.0.1", cfg.port, timeout=5)  # a probe: no request, no line
+    conn.connect()
+    conn.close()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        access = [ln for ln in sink.read_text().splitlines() if " web_ui.access: " in ln]
+        if len(access) >= 2:
+            break
+        time.sleep(0.05)
+    assert len(access) == 2, access
+    ok = next(ln for ln in access if " 200 " in ln)  # lines are written as connections close, in any order
+    assert "tcp GET http://projx.echo.here.localhost:" in ok
+    assert "/hello?x=1 200 " in ok and ok.endswith(" echo/projx")
+    bad = next(ln for ln in access if " 421 " in ln)
+    assert "evil.example" in bad and "not a web-ui name" in bad
+    assert " INFO web_ui.instances: starting echo projx" in sink.read_text()

@@ -10,6 +10,7 @@ from __future__ import annotations
 import shlex
 import sys
 
+from web_ui import log
 from web_ui.config import Config, Host, runtime_root
 from web_ui.runner import Launch
 
@@ -64,10 +65,14 @@ def unit_name(host: str) -> str:
 
 
 def launch(cfg: Config, host: Host) -> Launch:
-    """Run ``web-ui tunnel --batch HOST`` in the background."""
+    """Run ``web-ui tunnel --batch HOST`` in the background, with our config and logging."""
+    argv = [sys.executable, "-m", "web_ui"]
+    if cfg.path:
+        argv += ["--config", str(cfg.path)]
+    argv += [*log.argv(), "tunnel", "--batch", host.name]
     return Launch(
         unit=unit_name(host.name),
-        argv=[sys.executable, "-m", "web_ui", "tunnel", "--batch", host.name],
+        argv=argv,
         description=f"web-ui tunnel to {host.ssh}",
     )
 

@@ -16,11 +16,14 @@ import click
 
 from web_ui import __version__, instances, tunnel
 from web_ui import config as config_mod
+from web_ui import log as log_mod
 from web_ui.config import Config, ConfigError
 from web_ui.names import DEFAULT_INSTANCE, NameError_, url_for
 from web_ui.runner import Launch, RunnerError, get_runner
 
 PROXY_UNIT = "web-ui-proxy"
+
+log = logging.getLogger(__name__)
 
 
 class Ctx:
@@ -35,27 +38,64 @@ class Ctx:
                 self._cfg = config_mod.load(self.cfg_path)
             except (ConfigError, NameError_) as e:
                 raise click.ClickException(str(e))
+            c = self._cfg
+            log.debug("config %s: hostname=%s services=%s hosts=%s runner=%s declared=%s",
+                      c.path, c.hostname, sorted(c.services), sorted(c.hosts), c.runner,
+                      {f"{s}/{n}": d for (s, n), d in sorted(c.declared.items())})  # fmt: skip
         return self._cfg
+
+    def web_ui_argv(self) -> list[str]:
+        """How to run web-ui again, with this config and logging, in a child process."""
+        argv = [sys.executable, "-m", "web_ui"]
+        if self.cfg_path:
+            argv += ["--config", str(self.cfg_path)]
+        return argv + log_mod.argv()
+
+
+class Group(click.Group):
+    """Logs a command's failure before click reports it."""
+
+    def invoke(self, ctx: click.Context):
+        try:
+            return super().invoke(ctx)
+        except click.exceptions.Exit:
+            raise
+        except click.Abort:
+            log.error("aborted")
+            raise
+        except click.ClickException as e:
+            log.error("%s: %s", ctx.invoked_subcommand, e.format_message())
+            raise
+        except Exception:
+            log.critical("%s failed", ctx.invoked_subcommand, exc_info=True)
+            raise
 
 
 pass_ctx = click.make_pass_decorator(Ctx)
 
 
-@click.group(context_settings={"help_option_names": ["-h", "--help"]})
+@click.group(cls=Group, context_settings={"help_option_names": ["-h", "--help"]})
 @click.option("-c", "--config", "cfg_path", type=click.Path(path_type=Path), envvar="WEB_UI_CONFIG",
               help="Config file (default ~/.config/web-ui/config.toml).")  # fmt: skip
-@click.option("-v", "--verbose", count=True, help="More logging (repeatable).")
+@click.option("-l", "--log-level", type=click.Choice(log_mod.LEVELS, case_sensitive=False),
+              default=log_mod.DEFAULT_LEVEL, show_default=True, envvar="WEB_UI_LOG_LEVEL",
+              help="Least severe level to log.")  # fmt: skip
+@click.option("-L", "--log-sink", metavar="SINK", envvar="WEB_UI_LOG_SINK",
+              help="'stdout', 'stderr' or a file (default $XDG_STATE_HOME/web-ui/web-ui.log).")  # fmt: skip
 @click.version_option(__version__, "-V", "--version")
 @click.pass_context
-def main(ctx: click.Context, cfg_path: Path | None, verbose: int) -> None:
+def main(ctx: click.Context, cfg_path: Path | None, log_level: str, log_sink: str | None) -> None:
     """One front door per host for local web UIs.
 
     Each service instance listens on a private Unix socket.  A small proxy
     routes http://[INSTANCE.]SERVICE.HOST.localhost:PORT/ to it, locally or
     through one SSH-forwarded socket per remote host.
     """
-    level = logging.WARNING - 10 * verbose
-    logging.basicConfig(level=max(level, logging.DEBUG), format="web-ui: %(levelname)s: %(message)s")
+    try:
+        log_mod.setup(log_level, log_sink)
+    except OSError as e:
+        raise click.BadParameter(f"cannot open {e.filename}: {e.strerror}", param_hint="'-L' / '--log-sink'")
+    log.debug("%s (web-ui %s, python %s)", shlex.join(sys.argv), __version__, sys.version.split()[0])
     ctx.obj = Ctx(cfg_path)
 
 
@@ -102,11 +142,9 @@ def serve(obj: Ctx, port: int | None, no_tcp: bool, no_autostart: bool, detach: 
         if print_socket:
             click.echo(cfg.front_socket)
         if _proxy_live(cfg):
+            log.debug("proxy already live on %s", cfg.front_socket)
             return
-        argv = [sys.executable, "-m", "web_ui"]
-        if obj.cfg_path:
-            argv += ["--config", str(obj.cfg_path)]
-        argv += ["serve"]
+        argv = [*obj.web_ui_argv(), "serve"]
         if port is not None:
             argv += ["--port", str(port)]
         argv += (["--no-tcp"] if no_tcp else []) + (["--no-autostart"] if no_autostart else [])
@@ -117,14 +155,16 @@ def serve(obj: Ctx, port: int | None, no_tcp: bool, no_autostart: bool, detach: 
             raise _fail(e)
         for _ in range(100):
             if _proxy_live(cfg):
+                log.debug("detached proxy is live on %s", cfg.front_socket)
                 return
             time.sleep(0.1)
-        raise click.ClickException("proxy did not start; see: web-ui logs --proxy")
+        raise click.ClickException("proxy did not start; see: web-ui logs and web-ui logs --proxy")
     from web_ui import proxy
 
     try:
         proxy.run(cfg, port=0 if no_tcp else port, autostart=not no_autostart)
     except RuntimeError as e:
+        log.critical("proxy cannot run: %s", e)
         raise _fail(e)
 
 
@@ -152,6 +192,8 @@ def up(obj: Ctx, service: str, directory: str | None, name: str | None, no_start
         raise click.ClickException(f"instance {inst_name!r} of {service} already serves {existing.dir}; choose another --name")
     inst = existing or instances.Instance(service, inst_name, d, time.time())
     instances.save(cfg, inst)
+    if not existing:
+        log.info("registered %s %s for %s", service, inst_name, d)
     if not no_start:
         try:
             instances.start(cfg, inst)
@@ -183,6 +225,7 @@ def down(obj: Ctx, service: str, directory: str | None, name: str | None, forget
     msg = "stopped" if stopped else "was not running"
     if forget:
         if instances.forget(cfg, service, inst_name):
+            log.info("forgot %s %s", service, inst_name)
             msg += ", forgotten"
         if instances.is_declared(cfg, service, inst_name):
             msg += f" (still declared in {cfg.path})"
@@ -222,6 +265,7 @@ def run(obj: Ctx, service: str, directory: str | None, name: str | None) -> None
         click.echo(f"note: systemd properties are not applied in the foreground: {launch.properties}", err=True)
     click.echo(f"$ {shlex.join(launch.argv)}", err=True)
     click.echo(f"  {_url(cfg, service, inst_name)}", err=True)
+    log.debug("exec %s in %s with env %s", launch.argv, launch.cwd, launch.env)
     if launch.cwd:
         os.chdir(launch.cwd)
     try:
@@ -242,9 +286,11 @@ def _remote_status(cfg: Config, host: str) -> dict | None:
         conn.request("GET", "/status.json", headers={"Host": f"{host}.{cfg.domain}:{cfg.port}"})
         resp = conn.getresponse()
         if resp.status != 200:
+            log.debug("status of %s: HTTP %d", host, resp.status)
             return None
         return json.loads(resp.read())
-    except (OSError, ValueError, http.client.HTTPException):
+    except (OSError, ValueError, http.client.HTTPException) as e:
+        log.debug("status of %s: %s", host, e)
         return None
     finally:
         conn.close()
@@ -286,12 +332,19 @@ def ls(obj: Ctx, all_hosts: bool, as_json: bool) -> None:
 @main.command()
 @click.argument("service", required=False)
 @click.argument("instance", required=False)
-@click.option("--proxy", "of_proxy", is_flag=True, help="The proxy's log.")
-@click.option("--tunnel", "of_tunnel", metavar="HOST", help="The tunnel to HOST's log.")
+@click.option("--proxy", "of_proxy", is_flag=True, help="Output of the background proxy process.")
+@click.option("--tunnel", "of_tunnel", metavar="HOST", help="Output of the tunnel to HOST (ssh's errors).")
 @click.option("-f", "--follow", is_flag=True)
+@click.option("-n", "--lines", default=200, show_default=True, help="How many lines to show.")
 @pass_ctx
-def logs(obj: Ctx, service: str | None, instance: str | None, of_proxy: bool, of_tunnel: str | None, follow: bool) -> None:
-    """Show logs of an instance (SERVICE [INSTANCE]), the proxy or a tunnel."""
+def logs(obj: Ctx, service: str | None, instance: str | None, of_proxy: bool, of_tunnel: str | None,
+         follow: bool, lines: int) -> None:  # fmt: skip
+    """Show web-ui's log, or the output of an instance, the proxy or a tunnel.
+
+    With no arguments, show web-ui's own log file (the -L sink): the proxy's
+    access log and what web-ui did.  SERVICE [INSTANCE], --proxy and --tunnel
+    show what that process wrote to its stdout and stderr.
+    """
     cfg = obj.cfg
     if of_proxy:
         unit = PROXY_UNIT
@@ -300,8 +353,13 @@ def logs(obj: Ctx, service: str | None, instance: str | None, of_proxy: bool, of
     elif service:
         unit = instances.unit_name(service, instance or DEFAULT_INSTANCE)
     else:
-        raise click.UsageError("give SERVICE [INSTANCE], --proxy or --tunnel HOST")
-    cmd = get_runner(cfg).logs_command(unit, follow)
+        path = log_mod.current_file()
+        if path is None:
+            raise click.UsageError("the log sink is a stream, not a file; give -L FILE, or SERVICE, --proxy or --tunnel")
+        cmd = ["tail", "-n", str(lines), *(["-F"] if follow else []), str(path)]
+        os.execvp(cmd[0], cmd)
+    cmd = get_runner(cfg).logs_command(unit, follow, lines)
+    log.debug("exec %s", cmd)
     os.execvp(cmd[0], cmd)
 
 
@@ -322,6 +380,7 @@ def tunnel_cmd(obj: Ctx, host: str, batch: bool, print_only: bool, no_ensure: bo
     cfg = obj.cfg
     hcfg = cfg.host(host)
     ensure = tunnel.ensure_remote_argv(hcfg, batch) if hcfg.ensure_remote and not no_ensure else None
+    log.debug("tunnel to %s: ssh=%s ensure=%s", host, hcfg.ssh, ensure)
     if print_only:
         fwd = tunnel.forward_argv(cfg, hcfg, batch)
         if ensure:
@@ -336,14 +395,21 @@ def tunnel_cmd(obj: Ctx, host: str, batch: bool, print_only: bool, no_ensure: bo
     if ensure:
         import subprocess
 
+        log.debug("running %s", tunnel.describe(ensure))
         try:
             r = subprocess.run(ensure, timeout=60, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True)
+            log.debug("remote proxy on %s: exit %d, output %r", host, r.returncode, r.stdout)
             if r.returncode != 0:
+                log.warning("could not start the proxy on %s (ssh exit %d)", host, r.returncode)
                 click.echo(f"warning: could not start the proxy on {host} (exit {r.returncode})", err=True)
             remote_sock = tunnel.parse_front_socket(r.stdout)
         except subprocess.TimeoutExpired:
+            log.warning("timed out starting the proxy on %s", host)
             click.echo(f"warning: timed out starting the proxy on {host}", err=True)
+        if remote_sock is None:
+            log.debug("%s did not report its front socket; assuming %s", host, tunnel.remote_front_socket(hcfg))
     fwd = tunnel.forward_argv(cfg, hcfg, batch, remote_sock)
+    log.info("tunnel to %s: %s", host, tunnel.describe(fwd))
     os.execvp(fwd[0], fwd)
 
 

@@ -86,6 +86,13 @@ forwards the request. Processes run as:
 - plain detached children (`runner = "process"`), with logs in
   `~/.local/state/web-ui/logs/`.
 
+web-ui's own log goes to one sink per process (`-L`: a file, `stdout` or
+`stderr`), by default `~/.local/state/web-ui/web-ui.log`, shared by the CLI,
+the proxy and tunnels. At the default `info` level it holds the proxy's
+access log and the starts and stops of instances and tunnels. `-l debug`
+adds what is needed to trace a problem. Processes that web-ui starts in the
+background inherit the level and sink.
+
 ## The network and ssh
 
 The proxy has exactly one network listener: the loopback port on a seat,
@@ -154,7 +161,8 @@ service supports them.
 | `$XDG_RUNTIME_DIR/web-ui/front.sock` | this host's proxy |
 | `$XDG_RUNTIME_DIR/web-ui/<svc>/<name>.sock` or `.port` | an instance's endpoint |
 | `$XDG_RUNTIME_DIR/web-ui/hosts/<host>.sock` | tunnel to another host's `front.sock` |
-| `~/.local/state/web-ui/logs/` | logs, with `runner = "process"` |
+| `~/.local/state/web-ui/web-ui.log` | web-ui's own log (default `-L` sink) |
+| `~/.local/state/web-ui/logs/` | output of background processes, with `runner = "process"` |
 
 ## Limits
 

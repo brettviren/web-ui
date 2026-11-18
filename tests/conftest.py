@@ -3,6 +3,8 @@ from pathlib import Path
 
 import pytest
 
+from web_ui import log
+
 
 @pytest.fixture
 def env(monkeypatch):
@@ -14,3 +16,10 @@ def env(monkeypatch):
             monkeypatch.setenv(var, str(root / sub))
         monkeypatch.delenv("WEB_UI_CONFIG", raising=False)
         yield root
+
+
+@pytest.fixture(autouse=True)
+def reset_logging():
+    """CLI tests install a log handler on a temp dir; drop it after each test."""
+    yield
+    log.reset()

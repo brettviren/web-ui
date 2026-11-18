@@ -19,8 +19,8 @@ own origin, so cookies and storage stay separate.
 ## Install
 
 ```sh
-uv tool install /path/to/web-ui      # or: uv tool install --editable .
-cp examples/config.toml ~/.config/web-ui/config.toml   # and edit
+uv tool install git+https://github.com/brettviren/web-ui
+wget -O ~/.config/web-ui/config.toml https://raw.githubusercontent.com/brettviren/web-ui/refs/heads/main/examples/config.toml  # and edit
 ```
 
 Install it on every host and seat.  One config file can be copied to all of
@@ -37,7 +37,8 @@ cd ~/proj/foo && web-ui up maggie
 web-ui ls -a                   # instances here and on tunneled hosts
 web-ui down maggie --forget    # stop it (DIR or --name, like up)
 web-ui tunnel hostA            # forward hostA's front door (runs ssh in the foreground)
-web-ui logs maggie foo -f
+web-ui logs -f                 # web-ui's own log: proxy access log, starts and stops
+web-ui logs maggie foo -f      # an instance's output
 ```
 
 At a seat, open `http://localhost:8484/` for a landing page that lists the
@@ -91,6 +92,30 @@ instances and hosts.  Usually you don't need to start anything by hand:
 - **TCP-only services** still listen on a loopback port that other local
   users can reach directly.  Prefer services that can listen on a socket.
 
+## Logging
+
+Every command takes `-l/--log-level` (`debug`, `info` (default), `warning`,
+`error`, `critical`) and `-L/--log-sink`: `stdout`, `stderr` or a file name.
+The default sink is `$XDG_STATE_HOME/web-ui/web-ui.log` (mode 0600), shared
+by every web-ui process on the host, so each line carries its pid.  Give the
+options before the command (`web-ui -l debug serve`), or set
+`WEB_UI_LOG_LEVEL` and `WEB_UI_LOG_SINK`.  A proxy started by `serve
+--detach`, and a tunnel the proxy starts, use the level and sink of the
+process that started them.
+
+- `info` is the proxy's access log (one line per request: listener, method,
+  URL, status, bytes, time, backend, and why it was refused) plus the few
+  events that matter: listening, starting and stopping instances and tunnels.
+- `debug` traces the rest: config, commands run with their environment,
+  endpoints, routing, peer uids, origin checks.
+- Failures are `error`, with a traceback for unexpected ones; a command that
+  dies on an unexpected exception logs it as `critical`.
+
+`web-ui logs` shows the log file.  What instances, tunnels (ssh) and the
+background proxy write to stdout and stderr goes to the journal, or with
+`runner = "process"` to `~/.local/state/web-ui/logs/`: see `web-ui logs
+SERVICE [INSTANCE]`, `--tunnel HOST` and `--proxy`.
+
 ## Config
 
 See `examples/config.toml`.  `web-ui config` shows the effective settings and
@@ -106,6 +131,8 @@ paths.  Command placeholders: `{socket} {port} {dir} {instance} {service}
   there.  With `ensure_remote = false` it assumes the same uid as here,
   unless `remote_runtime_dir` says otherwise.
 - No idle shutdown yet: instances run until `web-ui down`.
+- The log file is never rotated by web-ui.  It reopens the file if it is
+  moved, so `logrotate` (with no `copytruncate`) works.
 - With the systemd runner, units started over ssh live in your user manager,
   which may exit when your last session ends.  Run `loginctl enable-linger`
   on hosts where they should outlive your logins.

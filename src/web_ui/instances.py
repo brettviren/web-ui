@@ -11,6 +11,7 @@ only listen on TCP, an ephemeral loopback port recorded next to it in
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -23,6 +24,7 @@ from web_ui.config import Config, ConfigError, Service, ensure_private_dir
 from web_ui.names import DEFAULT_INSTANCE, check_label, short_hash, slugify, url_for
 from web_ui.runner import Launch, get_runner
 
+log = logging.getLogger(__name__)
 
 @dataclass
 class Instance:
@@ -43,7 +45,12 @@ def get(cfg: Config, service: str, name: str) -> Instance | None:
     """A registered instance, else one the config declares for this host."""
     try:
         d = json.loads(_record(cfg, service, name).read_text())
-    except (OSError, ValueError):
+    except ValueError as e:
+        log.error("ignoring corrupt record %s: %s", _record(cfg, service, name), e)
+        d = None
+    except OSError:
+        d = None
+    if d is None:
         if (service, name) in cfg.declared:
             return Instance(service, name, cfg.declared[(service, name)])
         return None
@@ -58,6 +65,7 @@ def save(cfg: Config, inst: Instance) -> None:
     path = _record(cfg, inst.service, inst.name)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(asdict(inst), indent=2) + "\n")
+    log.debug("saved %s", path)
 
 
 def forget(cfg: Config, service: str, name: str) -> bool:
@@ -114,6 +122,7 @@ def resolve_dir(svc: Service, directory: str | None) -> Path | None:
         found = find_marker(base, svc.marker)
         if found is None:
             raise ConfigError(f"no {svc.marker} found at or above {base}")
+        log.debug("%s: found %s in %s (from %s)", svc.name, svc.marker, found, base)
         return found
     return base.resolve()
 
@@ -130,12 +139,15 @@ def choose_name(cfg: Config, svc: Service, directory: Path | None, name: str | N
         return DEFAULT_INSTANCE
     for inst in registered(cfg):
         if inst.service == svc.name and inst.dir == str(directory):
+            log.debug("%s: reusing instance %s for %s", svc.name, inst.name, directory)
             return inst.name
     slug = slugify(directory.name)
     other = get(cfg, svc.name, slug)
     if other is None or other.dir == str(directory):
         return slug
-    return f"{slug[:32]}-{short_hash(str(directory))}"
+    name = f"{slug[:32]}-{short_hash(str(directory))}"
+    log.debug("%s: %s is taken by %s; naming %s %s", svc.name, slug, other.dir, directory, name)
+    return name
 
 
 def unit_name(service: str, instance: str) -> str:
@@ -153,7 +165,10 @@ def endpoint(cfg: Config, service: str, name: str) -> tuple[str, object] | None:
     if svc and svc.listen == "tcp" or (not svc and portfile.exists()):
         try:
             return ("tcp", ("127.0.0.1", int(portfile.read_text().strip())))
-        except (OSError, ValueError):
+        except OSError:
+            return None
+        except ValueError as e:
+            log.warning("bad port file %s: %s", portfile, e)
             return None
     if svc or sock.exists():
         return ("unix", str(sock))
@@ -205,8 +220,10 @@ def prepare_launch(cfg: Config, inst: Instance) -> Launch:
     if svc.listen == "tcp":
         port = str(free_port())
         portfile.write_text(port + "\n")
-    else:
-        sock.unlink(missing_ok=True)  # stale from a previous run; we checked it is not live
+        log.debug("%s %s: port %s", inst.service, inst.name, port)
+    elif sock.exists():
+        log.debug("%s %s: removing stale %s", inst.service, inst.name, sock)
+        sock.unlink(missing_ok=True)  # we checked it is not live
     values = {
         "socket": str(sock),
         "port": port,
@@ -222,7 +239,10 @@ def prepare_launch(cfg: Config, inst: Instance) -> Launch:
     env.setdefault("PATH", search)
     argv = [expand(a, values) for a in svc.command]
     # systemd-run looks commands up with its own PATH, so hand it an absolute path.
-    argv[0] = shutil.which(argv[0], path=env["PATH"]) or argv[0]
+    found = shutil.which(argv[0], path=env["PATH"])
+    if found is None:
+        log.warning("%s: %s not found in PATH=%s", inst.service, argv[0], env["PATH"])
+    argv[0] = found or argv[0]
     return Launch(
         unit=unit_name(inst.service, inst.name),
         argv=argv,
@@ -240,28 +260,37 @@ class StartError(Exception):
 def start(cfg: Config, inst: Instance, wait: bool = True) -> None:
     """Start an instance unless it is already reachable, then wait until it is."""
     if is_up(cfg, inst.service, inst.name):
+        log.debug("%s %s is already up", inst.service, inst.name)
         return
     runner = get_runner(cfg)
     unit = unit_name(inst.service, inst.name)
     if runner.is_active(unit):
-        # Running but not reachable (yet, or wedged): restart so we know its endpoint.
+        log.warning("%s is running but not reachable; restarting it", unit)
         runner.stop(unit)
+    log.info("starting %s %s%s", inst.service, inst.name, f" in {inst.dir}" if inst.dir else "")
+    t0 = time.monotonic()
     runner.start(prepare_launch(cfg, inst))
     if not wait:
         return
     timeout = cfg.service(inst.service).start_timeout
-    deadline = time.monotonic() + timeout
+    deadline = t0 + timeout
     while time.monotonic() < deadline:
         if is_up(cfg, inst.service, inst.name):
+            log.info("%s %s is up after %.1fs at %s", inst.service, inst.name, time.monotonic() - t0,
+                     endpoint(cfg, inst.service, inst.name)[1])  # fmt: skip
             return
         if not runner.is_active(unit):
+            log.error("%s exited during startup; see: web-ui logs %s %s", unit, inst.service, inst.name)
             raise StartError(f"{unit} exited during startup; see: web-ui logs {inst.service} {inst.name}")
         time.sleep(0.1)
+    log.error("%s did not start listening within %gs", unit, timeout)
     raise StartError(f"{unit} did not start listening within {timeout:g}s")
 
 
 def stop(cfg: Config, service: str, name: str) -> bool:
     stopped = get_runner(cfg).stop(unit_name(service, name))
+    if stopped:
+        log.info("stopped %s %s", service, name)
     cfg.instance_portfile(service, name).unlink(missing_ok=True)
     sock = cfg.instance_socket(service, name)
     if sock.exists() and not probe(("unix", str(sock))):
