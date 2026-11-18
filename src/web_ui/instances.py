@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import socket
 import time
 from dataclasses import asdict, dataclass
@@ -39,11 +40,18 @@ def _record(cfg: Config, service: str, name: str) -> Path:
 
 
 def get(cfg: Config, service: str, name: str) -> Instance | None:
+    """A registered instance, else one the config declares for this host."""
     try:
         d = json.loads(_record(cfg, service, name).read_text())
     except (OSError, ValueError):
+        if (service, name) in cfg.declared:
+            return Instance(service, name, cfg.declared[(service, name)])
         return None
     return Instance(**{k: d.get(k) for k in ("service", "name", "dir", "created")})
+
+
+def is_declared(cfg: Config, service: str, name: str) -> bool:
+    return (service, name) in cfg.declared
 
 
 def save(cfg: Config, inst: Instance) -> None:
@@ -61,13 +69,11 @@ def forget(cfg: Config, service: str, name: str) -> bool:
 
 
 def registered(cfg: Config) -> list[Instance]:
-    out = []
+    """Instances recorded by 'web-ui up' plus those declared in the config."""
+    keys = set(cfg.declared)
     if cfg.instances_dir.is_dir():
-        for rec in sorted(cfg.instances_dir.glob("*/*.json")):
-            inst = get(cfg, rec.parent.name, rec.stem)
-            if inst:
-                out.append(inst)
-    return out
+        keys |= {(rec.parent.name, rec.stem) for rec in cfg.instances_dir.glob("*/*.json")}
+    return [inst for k in sorted(keys) if (inst := get(cfg, *k))]
 
 
 def discovered(cfg: Config) -> list[Instance]:
@@ -211,11 +217,17 @@ def prepare_launch(cfg: Config, inst: Instance) -> Launch:
         "url": url_for(cfg.hostname, inst.service, inst.name, cfg.domain, cfg.port).rstrip("/"),
         "runtime": str(cfg.runtime_dir),
     }
+    env = {k: expand(v, values) for k, v in svc.env.items()}
+    search = os.pathsep.join([str(Path(d).expanduser()) for d in cfg.bin_dirs] + [os.environ.get("PATH", "")])
+    env.setdefault("PATH", search)
+    argv = [expand(a, values) for a in svc.command]
+    # systemd-run looks commands up with its own PATH, so hand it an absolute path.
+    argv[0] = shutil.which(argv[0], path=env["PATH"]) or argv[0]
     return Launch(
         unit=unit_name(inst.service, inst.name),
-        argv=[expand(a, values) for a in svc.command],
+        argv=argv,
         cwd=inst.dir or None,
-        env={k: expand(v, values) for k, v in svc.env.items()},
+        env=env,
         properties=[expand(p, values) for p in svc.properties],
         description=f"web-ui {inst.service} {inst.name}" + (f" ({inst.dir})" if inst.dir else ""),
     )

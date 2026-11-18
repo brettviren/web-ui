@@ -61,6 +61,7 @@ class Service:
     env: dict[str, str] = field(default_factory=dict)
     start_timeout: float = 20.0
     autostart: bool = True
+    hosts: list[str] = field(default_factory=list)  # only offered on these hosts (default: all)
 
     @classmethod
     def from_dict(cls, name: str, d: dict) -> Service:
@@ -111,8 +112,13 @@ class Config:
     runner: str = "auto"  # systemd | process | auto
     check_uid: bool = True  # only serve connections from our own uid
     strict_origin: bool = True  # reject cross-origin unsafe requests and websockets
-    services: dict[str, Service] = field(default_factory=dict)
+    bin_dirs: list[str] = field(default_factory=list)  # prepended to PATH for launched services
+    services: dict[str, Service] = field(default_factory=dict)  # those offered on this host
     hosts: dict[str, Host] = field(default_factory=dict)
+    # Instances the config declares for this host: (service, name) -> directory.
+    declared: dict[tuple[str, str], str] = field(default_factory=dict)
+    # Services configured only for other hosts: name -> those hosts.
+    elsewhere: dict[str, list[str]] = field(default_factory=dict)
     path: Path | None = None
 
     # ---- paths -------------------------------------------------------------
@@ -162,6 +168,8 @@ class Config:
         try:
             return self.services[name]
         except KeyError:
+            if name in self.elsewhere:
+                raise ConfigError(f"service {name!r} is only configured for {', '.join(self.elsewhere[name])}")
             known = ", ".join(sorted(self.services)) or "none configured"
             raise ConfigError(f"unknown service {name!r} (known: {known}); add [services.{name}] to {config_file()}")
 
@@ -180,16 +188,53 @@ def load(path: Path | None = None) -> Config:
             raise ConfigError(f"{path}: {e}") from e
     services = {n: Service.from_dict(n, d) for n, d in data.pop("services", {}).items()}
     hosts = {n: Host.from_dict(n, d) for n, d in data.pop("hosts", {}).items()}
-    known = {f for f in Config.__dataclass_fields__} - {"services", "hosts", "path"}
+    declared = data.pop("instances", {})
+    known = {f for f in Config.__dataclass_fields__} - {"services", "hosts", "path", "declared", "elsewhere"}
     unknown = set(data) - known
     if unknown:
         raise ConfigError(f"{path}: unknown top-level keys {sorted(unknown)}")
-    cfg = Config(services=services, hosts=hosts, path=path, **data)
+    cfg = Config(hosts=hosts, path=path, **data)
+    for name, svc in services.items():
+        if not svc.hosts or any(cfg.is_self(h) for h in svc.hosts):
+            cfg.services[name] = svc
+        else:
+            cfg.elsewhere[name] = svc.hosts
+    cfg.declared = _declared(cfg, declared, services)
     if cfg.runner not in ("auto", "systemd", "process"):
         raise ConfigError(f"runner must be auto, systemd or process, not {cfg.runner!r}")
     for n in list(services) + [cfg.hostname] + cfg.aliases + list(hosts):
         check_label(n)
     return cfg
+
+
+def _declared(cfg: Config, table: dict, services: dict[str, Service]) -> dict[tuple[str, str], str]:
+    """Parse ``[instances.<host>.<service>] <name> = "<dir>"``, keeping this host's.
+
+    One config file can then be shared by every host, each picking its own.
+    A directory naming the service's marker (``.../.beads``) means its parent.
+    """
+    out = {}
+    for host, by_service in table.items():
+        check_label(host)
+        if not isinstance(by_service, dict):
+            raise ConfigError(f"[instances.{host}] must be a table of services")
+        for sname, names in by_service.items():
+            if sname not in services:
+                raise ConfigError(f"[instances.{host}.{sname}]: no service {sname!r}")
+            if not isinstance(names, dict):
+                raise ConfigError(f"[instances.{host}.{sname}] must map instance names to directories")
+            for iname, directory in names.items():
+                check_label(iname)
+                if not cfg.is_self(host):
+                    continue
+                if sname not in cfg.services:
+                    raise ConfigError(f"[instances.{host}.{sname}]: {sname} is not offered on {host}")
+                d = Path(str(directory)).expanduser()
+                marker = services[sname].marker
+                if marker and d.name == marker:
+                    d = d.parent
+                out[(sname, iname)] = str(d)
+    return out
 
 
 def ensure_private_dir(path: Path) -> Path:

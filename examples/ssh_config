@@ -1,0 +1,55 @@
+# ~/.ssh/config additions for web-ui
+#
+# You need NONE of this to use `web-ui tunnel HOST` (or the tunnel the proxy
+# opens on first visit): it passes its forward on the command line, and only
+# needs `ssh HOST` to work without a prompt.  Use this instead if you would
+# rather run the tunnel with plain ssh, e.g. from a systemd unit:
+#
+#   ssh -P web-ui -N wcgpu0
+#
+# One forward per host carries every web UI on it: the seat-side socket
+# hosts/<host>.sock reaches that host's web-ui front door.  It replaces
+# per-service port forwards such as
+#
+#   ssh -L 8080:localhost:8080 -L 7700:localhost:7700 -L 8088:localhost:8088 wcgpu0
+#
+# Tokens: %i is the LOCAL uid and %n the host name as typed.  The remote side
+# must name the uid on the REMOTE host, which differs when your login name
+# there differs.  Ask the host:
+#
+#   ssh wcgpu0 '~/.local/bin/web-ui serve --detach --print-socket'
+#
+# `web-ui gen ssh-config` prints these blocks for the hosts in your web-ui config.
+
+# ---- put this near the top: for most options the first value found wins ----
+
+# Only for `ssh -P web-ui ...`: a plain `ssh wcgpu0` (or kitten ssh) is untouched,
+# so interactive sessions don't fight over the forwarded socket.
+Match tagged web-ui
+  # Its own connection, not a client of a shared master: the tunnel lives
+  # exactly as long as this ssh.
+  ControlMaster no
+  ControlPath none
+  SessionType none
+  ExitOnForwardFailure yes
+  # Replace a stale socket left by an earlier tunnel, and make it ours only.
+  StreamLocalBindUnlink yes
+  StreamLocalBindMask 0177
+  ServerAliveInterval 30
+  ServerAliveCountMax 3
+
+Match tagged web-ui originalhost wcgpu0
+  # Replace 12345 with your uid on wcgpu0.
+  LocalForward /run/user/%i/web-ui/hosts/%n.sock /run/user/12345/web-ui/front.sock
+
+# A host where you have the same uid (same login under FreeIPA) can use %i twice.
+Match tagged web-ui originalhost haiku
+  LocalForward /run/user/%i/web-ui/hosts/%n.sock /run/user/%i/web-ui/front.sock
+
+# ---- your existing host blocks stay as they are, e.g. ----
+#
+# Host wcgpu0
+#   HostName wcgpu0.example.org
+#   User myname
+#   ProxyJump gateway.example.org
+#   GSSAPIAuthentication yes      # Kerberos: lets the proxy open tunnels with no prompt

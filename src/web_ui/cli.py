@@ -93,11 +93,14 @@ def _proxy_live(cfg: Config) -> bool:
 @click.option("--no-tcp", is_flag=True, help="Only listen on the Unix front socket (a host no browser sits at).")
 @click.option("--no-autostart", is_flag=True, help="Do not start instances or tunnels on first request.")
 @click.option("-d", "--detach", is_flag=True, help="Start the proxy in the background unless one is running.")
+@click.option("--print-socket", is_flag=True, help="With --detach: print the front socket's path (for tunnels).")
 @pass_ctx
-def serve(obj: Ctx, port: int | None, no_tcp: bool, no_autostart: bool, detach: bool) -> None:
+def serve(obj: Ctx, port: int | None, no_tcp: bool, no_autostart: bool, detach: bool, print_socket: bool) -> None:
     """Run the front-door proxy."""
     cfg = obj.cfg
     if detach:
+        if print_socket:
+            click.echo(cfg.front_socket)
         if _proxy_live(cfg):
             return
         argv = [sys.executable, "-m", "web_ui"]
@@ -178,8 +181,11 @@ def down(obj: Ctx, service: str, directory: str | None, name: str | None, forget
         raise click.ClickException(f"no instance {inst_name!r} of {service}")
     stopped = instances.stop(cfg, service, inst_name)
     msg = "stopped" if stopped else "was not running"
-    if forget and instances.forget(cfg, service, inst_name):
-        msg += ", forgotten"
+    if forget:
+        if instances.forget(cfg, service, inst_name):
+            msg += ", forgotten"
+        if instances.is_declared(cfg, service, inst_name):
+            msg += f" (still declared in {cfg.path})"
     click.echo(f"{service} {inst_name}: {msg}")
 
 
@@ -315,9 +321,9 @@ def tunnel_cmd(obj: Ctx, host: str, batch: bool, print_only: bool, no_ensure: bo
     """
     cfg = obj.cfg
     hcfg = cfg.host(host)
-    fwd = tunnel.forward_argv(cfg, hcfg, batch)
     ensure = tunnel.ensure_remote_argv(hcfg, batch) if hcfg.ensure_remote and not no_ensure else None
     if print_only:
+        fwd = tunnel.forward_argv(cfg, hcfg, batch)
         if ensure:
             click.echo(tunnel.describe(ensure))
         click.echo(tunnel.describe(fwd))
@@ -326,15 +332,18 @@ def tunnel_cmd(obj: Ctx, host: str, batch: bool, print_only: bool, no_ensure: bo
         raise click.ClickException(f"a tunnel to {host} is already up at {cfg.host_socket(host)}")
     config_mod.ensure_private_dir(cfg.runtime_dir)
     config_mod.ensure_private_dir(cfg.hosts_dir)
+    remote_sock = None
     if ensure:
         import subprocess
 
         try:
-            r = subprocess.run(ensure, timeout=60, stdin=subprocess.DEVNULL)
+            r = subprocess.run(ensure, timeout=60, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True)
             if r.returncode != 0:
                 click.echo(f"warning: could not start the proxy on {host} (exit {r.returncode})", err=True)
+            remote_sock = tunnel.parse_front_socket(r.stdout)
         except subprocess.TimeoutExpired:
             click.echo(f"warning: timed out starting the proxy on {host}", err=True)
+    fwd = tunnel.forward_argv(cfg, hcfg, batch, remote_sock)
     os.execvp(fwd[0], fwd)
 
 
@@ -440,4 +449,10 @@ def config_cmd(obj: Ctx) -> None:
     click.echo(f"instances:    {cfg.instances_dir}")
     click.echo(f"runner:       {get_runner(cfg).name}")
     click.echo(f"services:     {', '.join(sorted(cfg.services)) or '(none)'}")
+    if cfg.elsewhere:
+        click.echo("elsewhere:    " + ", ".join(f"{n} ({', '.join(h)})" for n, h in sorted(cfg.elsewhere.items())))
     click.echo(f"hosts:        {', '.join(sorted(cfg.hosts)) or '(none)'}")
+    if cfg.bin_dirs:
+        click.echo(f"bin_dirs:     {', '.join(cfg.bin_dirs)}")
+    for (svc, name), d in sorted(cfg.declared.items()):
+        click.echo(f"declared:     {_url(cfg, svc, name)}  {d}")

@@ -1,8 +1,9 @@
 # web-ui
 
 One front door per host for local web UIs (agentsview, maggie, wckb, ...),
-reached from any seat through one SSH tunnel per host.  See `ideas.md` for
-the reasoning.
+reached from any seat through one SSH tunnel per host.  See
+[docs/design.md](docs/design.md) for how it works and `ideas.md` for the
+reasoning.
 
 ```
 browser ──tcp──▶ seat proxy (127.0.0.1:8484)
@@ -22,8 +23,10 @@ uv tool install /path/to/web-ui      # or: uv tool install --editable .
 cp examples/config.toml ~/.config/web-ui/config.toml   # and edit
 ```
 
-Install it on every host and seat, with the same config if you like (each
-host picks its own name from its hostname).
+Install it on every host and seat.  One config file can be copied to all of
+them: each host takes its name from its hostname and uses the services and
+`[instances.<host>]` meant for it.  `examples/ssh_config` shows the
+equivalent plain-ssh setup, if you prefer it to `web-ui tunnel`.
 
 ## Use
 
@@ -64,7 +67,9 @@ instances and hosts.  Usually you don't need to start anything by hand:
   logs in the journal, sandboxing via `properties`) or, with
   `runner = "process"`, as detached children logging to
   `~/.local/state/web-ui/logs/`.
-- **Instances** are recorded in `~/.config/web-ui/instances/<svc>/<name>.json`.
+- **Instances** are declared per host in the config
+  (`[instances.<host>.<service>] name = "dir"`) or recorded by `web-ui up`
+  in `~/.config/web-ui/instances/<svc>/<name>.json`.
   The name is a slug of the project directory's basename, with a short hash
   appended if another directory already has it.  `up` in the same directory
   reuses the instance.  A service you start yourself on the canonical socket
@@ -97,6 +102,9 @@ paths.  Command placeholders: `{socket} {port} {dir} {instance} {service}
 - The `{url}` given to a service uses this host's name and the configured
   port.  If seats call a host something else, or use another port, set
   `hostname` in that host's config to match.
+- `web-ui tunnel` asks the remote for its socket path, which holds your uid
+  there.  With `ensure_remote = false` it assumes the same uid as here,
+  unless `remote_runtime_dir` says otherwise.
 - No idle shutdown yet: instances run until `web-ui down`.
 - With the systemd runner, units started over ssh live in your user manager,
   which may exit when your last session ends.  Run `loginctl enable-linger`
