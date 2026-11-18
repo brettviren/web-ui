@@ -50,6 +50,9 @@ instances and hosts.  Usually you don't need to start anything by hand:
 - **Tunnels open on first visit** for hosts in `[hosts.*]` with
   `autotunnel = true` (needs non-interactive ssh auth: an agent or Kerberos).
   The tunnel first runs `web-ui serve --detach` on the host.
+- **Hosts are revived.**  If a host's proxy stops while its tunnel stays up,
+  the next request (without a body) restarts it, and the tunnel if needed,
+  and is retried.  `web-ui hosts` says `dead` for such a tunnel.
 
 ## How it works
 

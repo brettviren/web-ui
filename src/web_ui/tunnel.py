@@ -8,6 +8,7 @@ connection.
 from __future__ import annotations
 
 import shlex
+import socket
 import sys
 
 from web_ui import log
@@ -108,3 +109,19 @@ def ssh_config_snippet(cfg: Config) -> str:
 
 def describe(argv: list[str]) -> str:
     return shlex.join(argv)
+
+
+def remote_answers(cfg: Config, host: str, timeout: float = 5.0) -> bool:
+    """Whether HOST's proxy answers through the tunnel, not just its local end.
+
+    ssh accepts on the forwarded socket even when nothing listens at the far
+    end; it then drops each connection without a byte.
+    """
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect(str(cfg.host_socket(host)))
+            s.sendall(f"GET /ping HTTP/1.1\r\nHost: {host}.{cfg.domain}\r\nConnection: close\r\n\r\n".encode())
+            return s.recv(5) == b"HTTP/"
+    except OSError:
+        return False

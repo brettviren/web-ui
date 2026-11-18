@@ -438,16 +438,17 @@ def tunnel_cmd(obj: Ctx, host: str, batch: bool, print_only: bool, no_ensure: bo
 @main.command()
 @pass_ctx
 def hosts(obj: Ctx) -> None:
-    """List remote hosts and whether their tunnel is up."""
+    """List remote hosts: up, - (no tunnel), or dead (tunnel up, its proxy not answering)."""
     cfg = obj.cfg
     names = set(cfg.hosts)
     if cfg.hosts_dir.is_dir():
         names |= {p.stem for p in cfg.hosts_dir.glob("*.sock")}
     for h in sorted(names):
         live = instances.probe(("unix", str(cfg.host_socket(h))))
+        state = ("up" if tunnel.remote_answers(cfg, h, timeout=3) else "dead") if live else "-"
         hc = cfg.host(h)
         auto = " autotunnel" if hc.autotunnel else ""
-        click.echo(f"{h:20} {'up' if live else '-':4} ssh={hc.ssh}{auto}  {url_for(h, domain=cfg.domain, port=cfg.port)}")
+        click.echo(f"{h:20} {state:4} ssh={hc.ssh}{auto}  {url_for(h, domain=cfg.domain, port=cfg.port)}")
 
 
 # ---- setup helpers -----------------------------------------------------------

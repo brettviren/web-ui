@@ -319,3 +319,78 @@ def test_singleton_has_one_instance(cfg, proxy):
     assert st == 404 and b"solo.here.localhost" in body
     st, _ = get(cfg, "other.ext.here.localhost")
     assert st == 404
+
+
+class DeadTunnel:
+    """What ssh does when nothing listens at the far end: accept, then drop."""
+
+    def __init__(self, path):
+        self.srv = socket.socket(socket.AF_UNIX)
+        self.srv.bind(str(path))
+        self.srv.listen(16)
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def run(self):
+        while True:
+            try:
+                conn, _ = self.srv.accept()
+            except OSError:
+                return
+            conn.close()
+
+    def close(self):
+        self.srv.shutdown(socket.SHUT_RDWR)
+        self.srv.close()
+
+
+def test_dead_tunnel_gives_502(cfg, proxy):
+    from web_ui import tunnel
+
+    dead = DeadTunnel(cfg.host_socket("there"))
+    try:
+        assert not tunnel.remote_answers(cfg, "there", timeout=2)
+        st, body = get(cfg, "x.maggie.there.localhost")
+        assert st == 502 and b"did not answer through the tunnel" in body
+        st, body = get(cfg, "localhost")
+        assert b"tunnel up, its proxy not answering" in body
+    finally:
+        dead.close()
+
+
+def test_dead_tunnel_revived(cfg, proxy, monkeypatch):
+    from web_ui import tunnel
+
+    cfg.hosts["there"].autotunnel = True
+    sock = cfg.host_socket("there")
+    dead = DeadTunnel(sock)
+    revived = []
+
+    def fake_run(argv, **kw):  # stands in for 'ssh there web-ui serve --detach'
+        dead.close()
+        sock.unlink()
+        revived.append(start_backend(sock))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr("web_ui.proxy.subprocess.run", fake_run)
+    try:
+        st, body = get(cfg, "x.maggie.there.localhost", "/again")
+        assert st == 200 and json.loads(body)["target"] == "/again"
+        assert len(revived) == 1 and tunnel.remote_answers(cfg, "there")
+    finally:
+        for p in revived:
+            p.terminate()
+            p.wait()
+
+
+def test_post_to_dead_tunnel_not_resent(cfg, proxy, monkeypatch):
+    cfg.hosts["there"].autotunnel = True
+    dead = DeadTunnel(cfg.host_socket("there"))
+    calls = []
+    monkeypatch.setattr("web_ui.proxy.subprocess.run", lambda *a, **k: calls.append(a))
+    try:
+        st, _ = get(cfg, "x.maggie.there.localhost", method="POST", body=b"data",
+                    headers={"Origin": f"http://x.maggie.there.localhost:{cfg.port}"})
+        assert st == 502 and calls == []
+    finally:
+        dead.close()

@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import signal
+import subprocess
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -55,6 +56,11 @@ MAX_HEAD = 64 * 1024
 HEAD_TIMEOUT = 30.0
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-connection"}
+
+
+def has_body(req: Request) -> bool:
+    """Whether a request carries a body (so it can't simply be sent again)."""
+    return req.get("transfer-encoding") is not None or (req.get("content-length") or "0").strip() != "0"
 
 
 class HTTPError(Exception):
@@ -384,8 +390,21 @@ class Proxy:
             for h in HOP_BY_HOP:
                 req.set(h, None)
             req.set("Connection", "close")
-        bwriter.write(req.encode())
+        head = req.encode()
+        bwriter.write(head)
         await self.splice(reader, writer, breader, bwriter, acc)
+        if acc.nbytes == 0 and remote and not has_body(req) and await self.revive_remote(target.host):
+            breader, bwriter = await self.connect_remote(target.host)
+            bwriter.write(head)
+            await self.splice(reader, writer, breader, bwriter, acc)
+        if acc.nbytes == 0:  # nothing reached the client yet, so it can still get an error page
+            if remote:
+                raise HTTPError(502, "Bad Gateway", f"{target.host}'s web-ui proxy did not answer through the tunnel",
+                                f"Start it: ssh {self.cfg.host(target.host).ssh} web-ui serve --detach.  "
+                                f"Or stop the tunnel (systemctl --user stop {tunnel.unit_name(target.host)}) "
+                                "and the next visit reopens it.")  # fmt: skip
+            raise HTTPError(502, "Bad Gateway", f"{acc.backend} closed the connection without answering",
+                            f"See: web-ui logs {target.service} {target.instance}")  # fmt: skip
 
     def check_origin(self, req: Request, host_header: str) -> None:
         """Refuse cross-origin state changes and WebSockets (CSRF, rebinding)."""
@@ -500,6 +519,45 @@ class Proxy:
         raise HTTPError(502, "Bad Gateway", f"tunnel to {hcfg.name} did not come up",
                         f"Check: web-ui logs --tunnel {hcfg.name}")  # fmt: skip
 
+    async def revive_remote(self, host: str) -> bool:
+        """Get HOST's proxy answering through the tunnel again.  True if it does.
+
+        First ask the host to start its proxy (it may have stopped while the
+        tunnel stayed up), then, if that is not enough, restart the tunnel.
+        """
+        cfg = self.cfg
+        hcfg = cfg.hosts.get(host)
+        if not (self.autostart and hcfg and hcfg.autotunnel):
+            return False
+        async with self.locks[f"tunnel/{host}"]:
+            if await asyncio.to_thread(tunnel.remote_answers, cfg, host):
+                return True  # another request revived it meanwhile
+            log.warning("%s's proxy does not answer through the tunnel; reviving it", host)
+            if hcfg.ensure_remote:
+                argv = tunnel.ensure_remote_argv(hcfg)
+                log.debug("running %s", tunnel.describe(argv))
+                try:
+                    r = await asyncio.to_thread(subprocess.run, argv, timeout=60, stdin=subprocess.DEVNULL,
+                                                capture_output=True, text=True)  # fmt: skip
+                    log.debug("exit %d, output %r, errors %r", r.returncode, r.stdout, r.stderr)
+                except subprocess.TimeoutExpired:
+                    log.error("timed out starting the proxy on %s", host)
+                if await asyncio.to_thread(tunnel.remote_answers, cfg, host):
+                    log.info("%s's proxy answers again", host)
+                    return True
+            runner = get_runner(cfg)
+            unit = tunnel.unit_name(host)
+            if not runner.is_active(unit):
+                log.error("%s still does not answer, and its tunnel is not one web-ui started", host)
+                return False
+            log.info("restarting the tunnel to %s", host)
+            await asyncio.to_thread(runner.stop, unit)
+            await asyncio.to_thread(self._start_tunnel, hcfg)
+        ok = await asyncio.to_thread(tunnel.remote_answers, cfg, host)
+        if not ok:
+            log.error("%s's proxy still does not answer through the new tunnel", host)
+        return ok
+
     @staticmethod
     async def splice(creader, cwriter, breader, bwriter, acc: Access | None = None) -> None:
         acc = acc or Access("-")
@@ -515,7 +573,8 @@ class Proxy:
                         acc.nbytes += len(data)
                     dst.write(data)
                     await dst.drain()
-                if dst.can_write_eof():
+                # A response that never started is left open, for an error page or a retry.
+                if dst.can_write_eof() and not (response and acc.nbytes == 0):
                     dst.write_eof()
             except (ConnectionError, OSError) as e:
                 log.debug("%s %s: %r", acc.backend, "response" if response else "request", e)
@@ -534,8 +593,13 @@ class Proxy:
 
     # ---- landing page ---------------------------------------------------
 
-    def status(self, port: int | None, label: str | None = None) -> dict:
-        """What runs here.  ``label`` is the name the client calls this host by."""
+    def status(self, port: int | None, label: str | None = None, probe_remote: bool = False) -> dict:
+        """What runs here.  ``label`` is the name the client calls this host by.
+
+        With ``probe_remote``, also ask each tunneled host's proxy whether it
+        answers.  Not for status.json, which other hosts' proxies ask for:
+        two seats tunneled to each other would ask each other forever.
+        """
         cfg = self.cfg
         label = label or cfg.hostname
         insts = []
@@ -561,7 +625,8 @@ class Proxy:
         host_list = [
             {
                 "host": h,
-                "tunnel": instances.probe(("unix", str(cfg.host_socket(h)))),
+                "tunnel": (tun := instances.probe(("unix", str(cfg.host_socket(h))))),
+                "answers": tun and probe_remote and tunnel.remote_answers(cfg, h, timeout=3),
                 "url": "http://" + hostname_for(h, domain=cfg.domain) + (f":{port}" if port else "") + "/",
             }
             for h in sorted(hosts - {cfg.hostname, label})
@@ -570,12 +635,14 @@ class Proxy:
 
     async def landing(self, req: Request, host_header: str, label: str) -> bytes:
         _, port = split_host_header(host_header)
-        st = await asyncio.to_thread(self.status, port, label)
         path = urlsplit(req.target).path
+        if path == "/ping":
+            return response(200, "OK", "ok\n", "text/plain")
+        if path not in ("/", "/status.json"):
+            raise HTTPError(404, "Not Found", f"no such page {path}")
+        st = await asyncio.to_thread(self.status, port, label, path == "/")
         if path == "/status.json":
             return response(200, "OK", json.dumps(st, indent=2) + "\n", "application/json")
-        if path != "/":
-            raise HTTPError(404, "Not Found", f"no such page {path}")
         esc = html.escape
         rows = []
         for i in st["instances"]:
@@ -591,7 +658,12 @@ class Proxy:
         if st["hosts"]:
             hrows = []
             for h in st["hosts"]:
-                state = '<span class=up>● connected</span>' if h["tunnel"] else '<span class=down>○ not connected</span>'
+                if h["answers"]:
+                    state = "<span class=up>● connected</span>"
+                elif h["tunnel"]:
+                    state = "<span class=down>◐ tunnel up, its proxy not answering (opening the host revives it)</span>"
+                else:
+                    state = "<span class=down>○ not connected</span>"
                 hrows.append(f'<tr><td><a href="{esc(h["url"])}">{esc(h["host"])}</a></td><td>{state}</td></tr>')
             body += "<h2>Other hosts</h2><table>" + "".join(hrows) + "</table>"
         return response(200, "OK", page(f"web-ui {st['host']}", body))

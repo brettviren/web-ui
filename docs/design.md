@@ -133,6 +133,16 @@ is up, it starts `web-ui tunnel --batch HOST` itself. `--batch` turns on ssh
 ticket). You can also run the tunnel with plain ssh; see
 `examples/ssh_config`.
 
+The tunnel can outlive the host's proxy: if that proxy stops, ssh still
+accepts on the local socket, then drops each connection without a byte. When
+a request gets no response at all from a host, the seat's proxy revives it
+and sends the request again, if it has no body. To revive the host, it first
+runs `web-ui serve --detach` there, then, if that isn't enough, restarts the
+tunnel. If the request has a body, or the revival fails, the seat's proxy
+returns a 502 that says what happened. The landing page and `web-ui hosts`
+check that each host's proxy answers (`GET /ping`), not just that the tunnel
+is up.
+
 No connection ever goes from a host back to a seat. Even status is pulled:
 the landing page and `web-ui ls -a` read `http://HOST.localhost/status.json`
 through the same tunnel.
