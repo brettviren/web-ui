@@ -1,0 +1,45 @@
+# ~/.config/web-ui/config.toml  (everything is optional)
+
+# hostname = "haiku"        # the label for this host in URLs; default: short hostname
+# aliases = []              # other labels meaning "this host"
+# domain = "localhost"      # browsers resolve *.localhost to loopback by themselves
+port = 8484                 # the one loopback TCP port, for browsers at this seat; 0 = none
+# runner = "auto"           # systemd (transient user units) | process | auto
+# check_uid = true          # refuse connections from other local users
+# strict_origin = true      # refuse cross-origin POST/PUT/... and WebSockets
+
+# ---- services ---------------------------------------------------------------
+# command placeholders: {socket} {port} {dir} {instance} {service} {host} {url} {runtime}
+# listen = "unix": the service listens on {socket}   (preferred)
+# listen = "tcp":  it listens on 127.0.0.1:{port}, a fresh ephemeral port per start
+
+# Verified with agentsview 0.33: TCP only; --public-url makes it trust the proxied origin.
+[services.agentsview]
+command = ["agentsview", "serve", "--no-browser", "--host", "127.0.0.1", "--port", "{port}", "--public-url", "{url}"]
+listen = "tcp"
+singleton = true            # one instance, URL agentsview.<host>.localhost
+start_timeout = 60          # its first sync can be slow
+
+# One instance per project holding .beads/.  The flags are a GUESS: check 'maggie --help'.
+[services.maggie]
+command = ["maggie", "--listen", "unix:{socket}", "{dir}/.beads"]
+marker = ".beads"
+# With the systemd runner, confine it to its project (needs unprivileged user namespaces):
+# properties = ["ProtectHome=tmpfs", "BindReadOnlyPaths={dir}", "BindReadOnlyPaths=/home/bv/.local/bin"]
+
+# One instance per .kb/ store.  Also a guess at the flags.
+[services.wckb]
+command = ["wckb", "serve", "--socket", "{socket}", "--root", "{dir}/.kb"]
+marker = ".kb"
+# env = { WCKB_LOG = "info" }
+# rewrite_host = true       # send Host: 127.0.0.1:<port>/localhost for backends that check it
+
+# ---- remote hosts this seat reaches -----------------------------------------
+
+[hosts.workbox]
+ssh = "workbox.example.org"   # ssh destination; default: the table name
+# autotunnel = true           # the proxy opens the tunnel on first request (needs non-interactive ssh auth)
+# ensure_remote = true        # run 'web-ui serve --detach' there first
+# web_ui = "~/.local/bin/web-ui"
+# remote_runtime_dir = "/run/user/1000"   # default: same as here (same uid under FreeIPA)
+# ssh_options = ["-o", "GSSAPIAuthentication=yes"]
