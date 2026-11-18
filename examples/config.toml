@@ -23,13 +23,17 @@ singleton = true            # one instance, URL agentsview.<host>.localhost
 hosts = ["workbox"]         # offered only on these hosts (default: all)
 start_timeout = 60          # its first sync can be slow
 
-# maggie (beads web UI) is configured by environment and listens on TCP,
-# by default on :8088 on EVERY interface, so pin it to a private loopback port.
+# maggie (beads web UI) is configured by environment.  Builds with Unix socket
+# support (MAGGIE_ADDR=unix:PATH, github.com/brettviren/maggie) listen on the
+# instance's private socket.
 [services.maggie]
 command = ["maggie"]
-listen = "tcp"
 marker = ".beads"           # `web-ui up maggie` finds the nearest .beads/ upward
-env = { MAGGIE_ADDR = "127.0.0.1:{port}", MAGGIE_BEADS_DIR = "{dir}" }
+env = { MAGGIE_ADDR = "unix:{socket}", MAGGIE_BEADS_DIR = "{dir}" }
+# Older builds only speak TCP, by default :8088 on EVERY interface; pin them
+# to a private loopback port instead:
+# listen = "tcp"
+# env = { MAGGIE_ADDR = "127.0.0.1:{port}", MAGGIE_BEADS_DIR = "{dir}" }
 # With the systemd runner, confine it to its project (needs unprivileged user namespaces):
 # properties = ["ProtectHome=tmpfs", "BindPaths={dir}", "BindReadOnlyPaths=/home/me/.local/bin"]
 
