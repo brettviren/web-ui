@@ -107,6 +107,8 @@ def _resolve(cfg: Config, service: str, directory: str | None, name: str | None)
     """Service config, project dir and instance name for SERVICE [DIR] [--name]."""
     try:
         svc = cfg.service(service)
+        if svc.singleton and name and name != DEFAULT_INSTANCE:
+            raise ConfigError(f"{service} has one instance; give no --name")
         if name and not directory:
             existing = instances.get(cfg, service, name)
             if existing:
@@ -119,6 +121,13 @@ def _resolve(cfg: Config, service: str, directory: str | None, name: str | None)
 
 def _url(cfg: Config, service: str, name: str, host: str | None = None) -> str:
     return url_for(host or cfg.hostname, service, name, cfg.domain, cfg.port)
+
+
+def _unmanaged(cfg: Config, service: str, what: str) -> None:
+    """Refuse to start or stop a service web-ui only connects to."""
+    svc = cfg.services.get(service)
+    if svc and not svc.managed:
+        raise click.ClickException(f"{service} is started outside web-ui (connect = {svc.connect!r}); {what} it there")
 
 
 def _proxy_live(cfg: Config) -> bool:
@@ -186,7 +195,17 @@ def up(obj: Ctx, service: str, directory: str | None, name: str | None, no_start
     Running it again for the same directory reuses the instance.
     """
     cfg = obj.cfg
-    _, d, inst_name = _resolve(cfg, service, directory, name)
+    svc, d, inst_name = _resolve(cfg, service, directory, name)
+    if not svc.managed:
+        url = _url(cfg, service, inst_name)
+        click.echo(url)
+        if not instances.is_up(cfg, service, inst_name):
+            click.echo(f"note: {service} is not running at {svc.connect}; web-ui does not start it", err=True)
+        if open_:
+            import webbrowser
+
+            webbrowser.open(url)
+        return
     existing = instances.get(cfg, service, inst_name)
     if existing and existing.dir != d and directory is not None:
         raise click.ClickException(f"instance {inst_name!r} of {service} already serves {existing.dir}; choose another --name")
@@ -218,6 +237,7 @@ def up(obj: Ctx, service: str, directory: str | None, name: str | None, no_start
 def down(obj: Ctx, service: str, directory: str | None, name: str | None, forget: bool) -> None:
     """Stop an instance (given like 'up': by DIRECTORY or --name)."""
     cfg = obj.cfg
+    _unmanaged(cfg, service, "stop")
     _, _, inst_name = _resolve(cfg, service, directory, name)
     if instances.get(cfg, service, inst_name) is None and not instances.is_up(cfg, service, inst_name):
         raise click.ClickException(f"no instance {inst_name!r} of {service}")
@@ -256,6 +276,7 @@ def url(obj: Ctx, service: str, directory: str | None, name: str | None, host: s
 def run(obj: Ctx, service: str, directory: str | None, name: str | None) -> None:
     """Run an instance in the foreground (for debugging its command)."""
     cfg = obj.cfg
+    _unmanaged(cfg, service, "run")
     _, d, inst_name = _resolve(cfg, service, directory, name)
     if instances.is_up(cfg, service, inst_name):
         raise click.ClickException(f"{service} {inst_name} is already running")
@@ -351,6 +372,7 @@ def logs(obj: Ctx, service: str | None, instance: str | None, of_proxy: bool, of
     elif of_tunnel:
         unit = tunnel.unit_name(of_tunnel)
     elif service:
+        _unmanaged(cfg, service, "find its logs")
         unit = instances.unit_name(service, instance or DEFAULT_INSTANCE)
     else:
         path = log_mod.current_file()
@@ -449,6 +471,7 @@ Description=web-ui front-door proxy
 
 [Service]
 ExecStart={exe} serve{args}
+ExecReload=kill -HUP $MAINPID
 Environment=PATH={path}
 Restart=on-failure
 
@@ -515,6 +538,10 @@ def config_cmd(obj: Ctx) -> None:
     click.echo(f"instances:    {cfg.instances_dir}")
     click.echo(f"runner:       {get_runner(cfg).name}")
     click.echo(f"services:     {', '.join(sorted(cfg.services)) or '(none)'}")
+    for svc in sorted(cfg.services.values(), key=lambda s: s.name):
+        if svc.connect:
+            how = "started by web-ui" if svc.managed else "started elsewhere"
+            click.echo(f"connect:      {svc.name} at {svc.connect} ({how})")
     if cfg.elsewhere:
         click.echo("elsewhere:    " + ", ".join(f"{n} ({', '.join(h)})" for n, h in sorted(cfg.elsewhere.items())))
     click.echo(f"hosts:        {', '.join(sorted(cfg.hosts)) or '(none)'}")

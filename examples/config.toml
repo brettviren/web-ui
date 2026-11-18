@@ -43,6 +43,20 @@ env = { MAGGIE_ADDR = "unix:{socket}", MAGGIE_BEADS_DIR = "{dir}" }
 command = ["kb", "web", "--socket", "{socket}"]
 # rewrite_host = true       # for backends that insist on Host: localhost / 127.0.0.1:<port>
 
+# A service started outside web-ui (supervisord, systemd, by hand): web-ui
+# only connects to it, at "unix:PATH" or "HOST:PORT" (~ and $VARS expand on
+# each host).  It is a singleton, and `web-ui up/down` won't start or stop it.
+# Verified with syncthing 1.29: start it with
+#   syncthing -no-browser -gui-address=unix://$HOME/.config/syncthing/gui.sock
+# (see examples/supervisor.conf).  The flag overrides config.xml without
+# changing it, and serves plain HTTP on the socket even with tls="true"
+# there, which web-ui needs.  Its login and CSRF work through the proxy.
+# Keeping TCP instead: -gui-address=http://127.0.0.1:8384 and
+# connect = "127.0.0.1:8384".
+[services.syncthing]
+connect = "unix:~/.config/syncthing/gui.sock"
+# command = [...]           # also give a command to have web-ui start it there on first visit
+
 # ---- instances declared per host --------------------------------------------
 # The same file can then be copied to every host; each starts its own on
 # first visit.  `web-ui up SERVICE DIR` adds more on the fly.

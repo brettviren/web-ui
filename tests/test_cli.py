@@ -137,3 +137,46 @@ def test_parse_front_socket():
 
     assert parse_front_socket("motd junk\n/run/user/5123/web-ui/front.sock\n") == "/run/user/5123/web-ui/front.sock"
     assert parse_front_socket("") is None
+
+
+def test_connect_parsing(env):
+    from web_ui.config import ConfigError, Service, parse_connect
+
+    assert parse_connect("unix:///a/b.sock") == ("unix", "/a/b.sock")
+    assert parse_connect("unix:/a/b.sock") == ("unix", "/a/b.sock")
+    assert parse_connect("unix:~/x.sock")[1].endswith("/x.sock")
+    assert parse_connect("127.0.0.1:8384") == ("tcp", ("127.0.0.1", 8384))
+    assert parse_connect("tcp:[::1]:8384") == ("tcp", ("::1", 8384))
+    for bad in ("unix:rel.sock", "localhost", "host:port"):
+        with pytest.raises(ValueError):
+            parse_connect(bad)
+    svc = Service.from_dict("st", {"connect": "127.0.0.1:8384"})
+    assert svc.listen == "tcp" and svc.singleton and not svc.managed
+    for bad in ({}, {"connect": "nope"}, {"connect": "unix:/s", "marker": ".x"}, {"connect": "unix:/s", "singleton": False}):
+        with pytest.raises(ConfigError):
+            Service.from_dict("st", bad)
+
+
+def test_unmanaged_cli(env):
+    path = env / "c" / "web-ui" / "config.toml"
+    path.parent.mkdir(parents=True)
+    path.write_text(f'hostname = "here"\n[services.st]\nconnect = "unix:{env}/st.sock"\n')
+    r = CliRunner().invoke(main, ["up", "st"])
+    assert r.exit_code == 0 and r.stdout.strip() == "http://st.here.localhost:8484/"
+    assert "does not start it" in r.stderr
+    for cmd in (["down", "st"], ["run", "st"], ["logs", "st"]):
+        r = CliRunner().invoke(main, cmd)
+        assert r.exit_code != 0 and "started outside web-ui" in r.output, cmd
+    r = CliRunner().invoke(main, ["config"])
+    assert f"st at unix:{env}/st.sock (started elsewhere)" in r.output
+
+
+def test_singleton_instances_not_declared(env):
+    path = env / "c" / "web-ui" / "config.toml"
+    path.parent.mkdir(parents=True)
+    path.write_text('hostname = "here"\n[services.st]\nconnect = "unix:/x.sock"\n[instances.here.st]\nfoo = "/tmp"\n')
+    with pytest.raises(config.ConfigError, match="has one instance"):
+        config.load(path)
+    path.write_text('hostname = "here"\n[services.st]\nconnect = "unix:/x.sock"\n')
+    r = CliRunner().invoke(main, ["up", "st", "--name", "foo"])
+    assert r.exit_code != 0 and "has one instance" in r.output

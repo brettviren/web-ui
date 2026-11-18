@@ -49,10 +49,33 @@ def short_hostname() -> str:
     return socket.gethostname().split(".")[0].lower()
 
 
+def parse_connect(addr: str) -> tuple[str, object]:
+    """``unix:PATH`` (or ``unix://PATH``), ``tcp:HOST:PORT`` or ``HOST:PORT``.
+
+    PATH may start with ``~`` and use ``$VARS``, expanded on the host that
+    reads the config.  Returns ('unix', path) or ('tcp', (host, port)), like
+    an instance endpoint.
+    """
+    if addr.startswith("unix:"):
+        path = addr.removeprefix("unix:").removeprefix("//")
+        path = os.path.expanduser(os.path.expandvars(path))
+        if not path.startswith("/"):
+            raise ValueError(f"{addr!r}: the socket path must be absolute")
+        return ("unix", path)
+    hostport = addr.removeprefix("tcp:")
+    host, sep, port = hostport.rpartition(":")
+    if not sep or not host or not port.isdigit():
+        raise ValueError(f"{addr!r} is not unix:PATH or HOST:PORT")
+    return ("tcp", (host.strip("[]"), int(port)))
+
+
 @dataclass
 class Service:
     name: str
-    command: list[str]
+    command: list[str] = field(default_factory=list)  # empty: started outside web-ui (needs connect)
+    # A fixed address the service listens on instead of web-ui's {socket} or {port},
+    # e.g. "unix:~/.config/syncthing/gui.sock" or "127.0.0.1:8384".  Makes it a singleton.
+    connect: str | None = None
     listen: str = "unix"  # "unix": service listens on {socket}; "tcp": on 127.0.0.1:{port}
     marker: str | None = None  # e.g. ".beads": instance dir is found by searching upward
     singleton: bool = False  # one instance ("default"), no directory
@@ -65,21 +88,35 @@ class Service:
 
     @classmethod
     def from_dict(cls, name: str, d: dict) -> Service:
-        cmd = d.get("command")
-        if cmd is None:
-            raise ConfigError(f"service {name!r} has no 'command'")
-        if isinstance(cmd, str):
-            cmd = shlex.split(cmd)
-        listen = d.get("listen", "unix")
-        if listen not in ("unix", "tcp"):
-            raise ConfigError(f"service {name!r}: listen must be 'unix' or 'tcp', not {listen!r}")
         known = {f for f in cls.__dataclass_fields__} - {"name"}
         unknown = set(d) - known
         if unknown:
             raise ConfigError(f"service {name!r}: unknown keys {sorted(unknown)}")
         kw = {k: v for k, v in d.items() if k in known}
-        kw["command"] = list(cmd)
+        cmd = d.get("command")
+        connect = d.get("connect")
+        if cmd is None and connect is None:
+            raise ConfigError(f"service {name!r} needs a 'command', or a 'connect' address if started elsewhere")
+        if isinstance(cmd, str):
+            cmd = shlex.split(cmd)
+        kw["command"] = list(cmd or [])
+        listen = d.get("listen", "unix")
+        if listen not in ("unix", "tcp"):
+            raise ConfigError(f"service {name!r}: listen must be 'unix' or 'tcp', not {listen!r}")
+        if connect is not None:
+            if d.get("marker") or d.get("singleton") is False:
+                raise ConfigError(f"service {name!r}: with 'connect' there is one instance, so no marker or singleton")
+            try:
+                kw["listen"] = parse_connect(str(connect))[0]
+            except ValueError as e:
+                raise ConfigError(f"service {name!r}: connect {e}") from e
+            kw["singleton"] = True
         return cls(name=name, **kw)
+
+    @property
+    def managed(self) -> bool:
+        """Whether web-ui starts (and stops) it."""
+        return bool(self.command)
 
 
 @dataclass
@@ -223,6 +260,8 @@ def _declared(cfg: Config, table: dict, services: dict[str, Service]) -> dict[tu
                 raise ConfigError(f"[instances.{host}.{sname}]: no service {sname!r}")
             if not isinstance(names, dict):
                 raise ConfigError(f"[instances.{host}.{sname}] must map instance names to directories")
+            if services[sname].singleton:
+                raise ConfigError(f"[instances.{host}.{sname}]: {sname} has one instance, which needs no declaring")
             for iname, directory in names.items():
                 check_label(iname)
                 if not cfg.is_self(host):

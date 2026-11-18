@@ -41,6 +41,13 @@ listen = "tcp"
 singleton = true
 rewrite_host = true
 
+[services.ext]
+connect = "unix:{env}/ext.sock"
+
+[services.extcmd]
+command = ["{sys.executable}", "{BACKEND}", "--socket", "{{socket}}"]
+connect = "unix:$XDG_RUNTIME_DIR/extcmd.sock"
+
 [hosts.there]
 autotunnel = false
 """)
@@ -234,3 +241,81 @@ def test_access_log(env, cfg, proxy):
     bad = next(ln for ln in access if " 421 " in ln)
     assert "evil.example" in bad and "not a web-ui name" in bad
     assert " INFO web_ui.instances: starting echo projx" in sink.read_text()
+
+
+def start_backend(path):
+    proc = subprocess.Popen([sys.executable, BACKEND, "--socket", str(path)])
+    deadline = time.monotonic() + 5
+    while not instances.probe(("unix", str(path))):
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+    return proc
+
+
+def test_external_service(env, cfg, proxy):
+    svc = cfg.services["ext"]
+    assert svc.singleton and not svc.managed and svc.listen == "unix"
+    st, body = get(cfg, "ext.here.localhost")
+    assert st == 502 and b"does not start it" in body
+    assert instances.get(cfg, "ext", "default") is None  # nothing registered
+    proc = start_backend(env / "ext.sock")
+    try:
+        st, body = get(cfg, "ext.here.localhost", "/x")
+        assert st == 200 and json.loads(body)["target"] == "/x"
+        st, body = get(cfg, "localhost", "/status.json")
+        ext = next(i for i in json.loads(body)["instances"] if i["service"] == "ext")
+        assert ext["up"] and ext["instance"] == "default"
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+def test_connect_with_command_autostarts_there(env, cfg, proxy):
+    st, body = get(cfg, "extcmd.here.localhost")
+    assert st == 200
+    assert (env / "r" / "extcmd.sock").is_socket()
+
+
+def test_reload_on_change(env, cfg, proxy):
+    from web_ui import log
+
+    sink = env / "reload.log"
+    log.setup("info", str(sink))
+    assert get(cfg, "new.here.localhost")[0] == 404
+    text = cfg.path.read_text()
+    cfg.path.write_text(text + f'\n[services.new]\nconnect = "unix:{env}/new.sock"\n')
+    proc = start_backend(env / "new.sock")
+    try:
+        assert get(cfg, "new.here.localhost")[0] == 200
+        # A broken edit is logged once and the config in use is kept.
+        cfg.path.write_text(text + "\n[services.new\n")
+        assert get(cfg, "new.here.localhost")[0] == 200
+        assert get(cfg, "new.here.localhost")[0] == 200
+    finally:
+        proc.terminate()
+        proc.wait()
+    cfg.path.write_text(text)
+    assert get(cfg, "new.here.localhost")[0] == 404
+    lines = sink.read_text().splitlines()
+    assert any("reloaded config" in ln and "services +new" in ln for ln in lines)
+    assert sum("not reloading config" in ln for ln in lines) == 1
+    assert any("reloaded config" in ln and "services -new" in ln for ln in lines)
+
+
+def test_reload_forced_and_port_warning(env, cfg, proxy):
+    from web_ui import log
+
+    sink = env / "reload.log"
+    log.setup("info", str(sink))
+    assert proxy.reload(force=True)
+    assert "(no changes)" in sink.read_text()
+    cfg.path.write_text(cfg.path.read_text().replace(f"port = {cfg.port}", "port = 1"))
+    assert proxy.reload()
+    assert proxy.port == cfg.port and "restart the proxy" in sink.read_text()
+
+
+def test_singleton_has_one_instance(cfg, proxy):
+    st, body = get(cfg, "other.solo.here.localhost")
+    assert st == 404 and b"solo.here.localhost" in body
+    st, _ = get(cfg, "other.ext.here.localhost")
+    assert st == 404

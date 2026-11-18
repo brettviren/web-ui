@@ -1,6 +1,6 @@
 # web-ui
 
-One front door per host for local web UIs (agentsview, maggie, wckb, ...),
+One front door per host for local web UIs (agentsview, maggie, wckb, syncthing, ...),
 reached from any seat through one SSH tunnel per host.  See
 [docs/design.md](docs/design.md) for how it works and `ideas.md` for the
 reasoning.
@@ -118,9 +118,23 @@ SERVICE [INSTANCE]`, `--tunnel HOST` and `--proxy`.
 
 ## Config
 
+A running proxy picks up edits to its config file on the next request (or
+on `SIGHUP`; `systemctl --user reload web-ui-proxy` with the generated
+unit).  It logs what changed.  A file that doesn't parse is logged as an
+error and the previous config stays in use.  Changing `port` needs a
+restart.  Running instances keep the command they were started with; stop
+them (`web-ui down`) to have the next visit start the new one.
+
 See `examples/config.toml`.  `web-ui config` shows the effective settings and
 paths.  Command placeholders: `{socket} {port} {dir} {instance} {service}
 {host} {url} {runtime}`.
+
+A service that something else starts (supervisord, systemd, by hand) gets a
+`connect` address instead of a `command`: `connect = "unix:~/path/gui.sock"`
+or `"127.0.0.1:8384"`.  It is a singleton, routed to while it is up, and
+never started or stopped by web-ui.  syncthing is the example: see
+`examples/config.toml` and `examples/supervisor.conf` for running its GUI on
+a Unix socket.
 
 ## Limits and next steps
 

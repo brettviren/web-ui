@@ -34,8 +34,9 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
+from web_ui import config as config_mod
 from web_ui import instances, tunnel
-from web_ui.config import Config, ensure_private_dir
+from web_ui.config import Config, ConfigError, ensure_private_dir
 from web_ui.names import (
     DEFAULT_INSTANCE,
     NameError_,
@@ -177,14 +178,76 @@ def error_page(e: HTTPError) -> bytes:
     return response(e.status, e.reason, page(f"{e.status} {e.reason}", body))
 
 
+def _file_signature(path) -> tuple | None:
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size, st.st_ino)
+
+
+def config_changes(old: Config, new: Config) -> list[str]:
+    """What a reload changes, briefly, for the log."""
+    out = []
+
+    def diff(what: str, a, b) -> None:
+        added, removed = sorted(set(b) - set(a)), sorted(set(a) - set(b))
+        changed = sorted(k for k in set(a) & set(b) if a[k] != b[k])
+        for sign, keys in (("+", added), ("-", removed), ("~", changed)):
+            if keys:
+                out.append(f"{what} {sign}{', '.join(map(str, keys))}")
+
+    diff("services", old.services, new.services)
+    diff("hosts", old.hosts, new.hosts)
+    diff("instances", {f"{s}/{n}": d for (s, n), d in old.declared.items()},
+         {f"{s}/{n}": d for (s, n), d in new.declared.items()})  # fmt: skip
+    for key in ("hostname", "aliases", "domain", "port", "runner", "check_uid", "strict_origin", "bin_dirs"):
+        if getattr(old, key) != getattr(new, key):
+            out.append(f"{key} {getattr(old, key)!r} -> {getattr(new, key)!r}")
+    return out
+
+
 class Proxy:
     def __init__(self, cfg: Config, port: int | None = None, autostart: bool = True):
         self.cfg = cfg
+        self.cfg_signature = _file_signature(cfg.path) if cfg.path else None
+        self.port_from_config = port is None
         self.port = cfg.port if port is None else port
         self.autostart = autostart
         self.uid = os.getuid()
         self.locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self.servers: list[asyncio.base_events.Server] = []
+
+    # ---- config ---------------------------------------------------------
+
+    def reload(self, force: bool = False) -> bool:
+        """Reload the config file if it changed (or ``force``).  True if reloaded.
+
+        Called before each request, so an edit takes effect on the next one.
+        A file that is missing or does not parse is logged and the config in
+        use is kept: an editor may be half way through saving it.
+        """
+        path = self.cfg.path
+        if path is None:
+            return False
+        sig = _file_signature(path)
+        if sig == self.cfg_signature and not force:
+            return False
+        self.cfg_signature = sig  # also on failure: say so once per change, not per request
+        if sig is None:
+            log.warning("config %s is gone; keeping the config in use", path)
+            return False
+        try:
+            new = config_mod.load(path)
+        except (ConfigError, NameError_) as e:
+            log.error("not reloading config: %s (keeping the config in use)", e)
+            return False
+        changes = config_changes(self.cfg, new)
+        self.cfg = new
+        log.info("reloaded config %s%s", path, (": " + "; ".join(changes)) if changes else " (no changes)")
+        if self.port_from_config and new.port != self.port:
+            log.warning("port changed to %s: restart the proxy to listen there (still on %s)", new.port, self.port)
+        return True
 
     # ---- listening ------------------------------------------------------
 
@@ -236,6 +299,7 @@ class Proxy:
 
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, on_signal, sig)
+        loop.add_signal_handler(signal.SIGHUP, self.reload, True)
         log.debug("serving %s as uid %d: autostart=%s check_uid=%s strict_origin=%s",
                   self.cfg.hostname, self.uid, self.autostart, self.cfg.check_uid, self.cfg.strict_origin)  # fmt: skip
         try:
@@ -275,6 +339,7 @@ class Proxy:
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, acc: Access) -> None:
         kind = acc.kind
+        self.reload()
         try:
             head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), HEAD_TIMEOUT)
         except asyncio.LimitOverrunError:
@@ -349,6 +414,9 @@ class Proxy:
         svc = cfg.services.get(svc_name)
         ep = instances.endpoint(cfg, svc_name, name)
         log.debug("%s/%s endpoint %s", svc_name, name, ep)
+        if svc and svc.singleton and name != DEFAULT_INSTANCE:
+            raise HTTPError(404, "Not Found", f"{svc_name} has one instance on {cfg.hostname}",
+                            f"Use {hostname_for(target.host or cfg.hostname, svc_name, DEFAULT_INSTANCE, cfg.domain)}")  # fmt: skip
         if not instances.probe(ep):
             inst = instances.get(cfg, svc_name, name)
             if inst is None and svc and svc.singleton and name == DEFAULT_INSTANCE:
@@ -358,6 +426,9 @@ class Proxy:
                 if svc is None:
                     hint = f"{svc_name!r} is not a configured service on {cfg.hostname}."
                 raise HTTPError(404, "Not Found", f"no instance {name!r} of {svc_name!r} on {cfg.hostname}", hint)
+            if not svc.managed:
+                raise HTTPError(502, "Bad Gateway", f"{svc_name} is not running on {cfg.hostname}",
+                                f"web-ui connects to it at {svc.connect} but does not start it.")  # fmt: skip
             if not (self.autostart and svc.autostart):
                 raise HTTPError(502, "Bad Gateway", f"{svc_name} {name} is not running", f"web-ui up {svc_name} --name {name}")
             async with self.locks[f"{svc_name}/{name}"]:
@@ -479,7 +550,8 @@ class Proxy:
         for svc in cfg.services.values():
             if svc.singleton and (svc.name, DEFAULT_INSTANCE) not in seen:
                 insts.append({
-                    "service": svc.name, "instance": DEFAULT_INSTANCE, "dir": None, "up": False,
+                    "service": svc.name, "instance": DEFAULT_INSTANCE, "dir": None,
+                    "up": instances.is_up(cfg, svc.name, DEFAULT_INSTANCE),
                     "url": "http://" + hostname_for(label, svc.name, DEFAULT_INSTANCE, cfg.domain) + (f":{port}" if port else "") + "/",
                 })  # fmt: skip
         insts.sort(key=lambda d: (d["service"], d["instance"]))

@@ -20,7 +20,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from web_ui.config import Config, ConfigError, Service, ensure_private_dir
+from web_ui.config import Config, ConfigError, Service, ensure_private_dir, parse_connect
 from web_ui.names import DEFAULT_INSTANCE, check_label, short_hash, slugify, url_for
 from web_ui.runner import Launch, get_runner
 
@@ -160,6 +160,8 @@ def unit_name(service: str, instance: str) -> str:
 def endpoint(cfg: Config, service: str, name: str) -> tuple[str, object] | None:
     """('unix', path) or ('tcp', (host, port)), or None if nothing is known."""
     svc = cfg.services.get(service)
+    if svc and svc.connect:
+        return parse_connect(svc.connect)
     sock = cfg.instance_socket(service, name)
     portfile = cfg.instance_portfile(service, name)
     if svc and svc.listen == "tcp" or (not svc and portfile.exists()):
@@ -213,11 +215,19 @@ def prepare_launch(cfg: Config, inst: Instance) -> Launch:
     Placeholders: {socket} {port} {dir} {instance} {service} {host} {url} {runtime}.
     """
     svc = cfg.service(inst.service)
+    if not svc.managed:
+        raise ConfigError(f"{svc.name} has no command: it is started outside web-ui")
     ensure_private_dir(cfg.service_dir(inst.service))
     sock = cfg.instance_socket(inst.service, inst.name)
     portfile = cfg.instance_portfile(inst.service, inst.name)
     port = ""
-    if svc.listen == "tcp":
+    if svc.connect:  # a fixed address: the service itself replaces any stale socket
+        kind, addr = parse_connect(svc.connect)
+        if kind == "unix":
+            sock = Path(addr)
+        else:
+            port = str(addr[1])
+    elif svc.listen == "tcp":
         port = str(free_port())
         portfile.write_text(port + "\n")
         log.debug("%s %s: port %s", inst.service, inst.name, port)
@@ -262,6 +272,9 @@ def start(cfg: Config, inst: Instance, wait: bool = True) -> None:
     if is_up(cfg, inst.service, inst.name):
         log.debug("%s %s is already up", inst.service, inst.name)
         return
+    svc = cfg.service(inst.service)
+    if not svc.managed:
+        raise StartError(f"{svc.name} is not running at {svc.connect}, and web-ui does not start it (no command)")
     runner = get_runner(cfg)
     unit = unit_name(inst.service, inst.name)
     if runner.is_active(unit):

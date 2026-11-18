@@ -66,10 +66,13 @@ places:
 
 For each connection, the proxy:
 
-1. reads the request headers;
-2. checks them (see Security);
-3. connects to the backend;
-4. copies bytes both ways until either side closes.
+1. reloads its config if the file changed since the last request (one
+   `stat`; a file that doesn't parse is logged and the previous config
+   kept);
+2. reads the request headers;
+3. checks them (see Security);
+4. connects to the backend;
+5. copies bytes both ways until either side closes.
 
 Because it copies raw bytes, server-sent events (maggie, agentsview) and
 WebSockets pass through unchanged. Each request gets its own backend
@@ -85,6 +88,11 @@ forwards the request. Processes run as:
   journal and optional sandboxing `properties`; or
 - plain detached children (`runner = "process"`), with logs in
   `~/.local/state/web-ui/logs/`.
+
+A service can also be started by something else (syncthing, under
+supervisord). Its config gives a fixed `connect` address instead of a
+command: a Unix socket path, or a loopback port. web-ui routes to it while
+it is up, and never starts or stops it.
 
 web-ui's own log goes to one sink per process (`-L`: a file, `stdout` or
 `stderr`), by default `~/.local/state/web-ui/web-ui.log`, shared by the CLI,
