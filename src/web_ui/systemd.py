@@ -24,6 +24,7 @@ import os
 import shlex
 import socket
 import subprocess
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -114,6 +115,32 @@ def _transient(run: Callable[..., subprocess.CompletedProcess], unit: str) -> bo
     return props.get("Transient") == "yes" and props.get("ActiveState") in ("active", "activating", "reloading")
 
 
+def _stop_transient(run: Callable[..., subprocess.CompletedProcess], unit: str, wait: float = 10.0) -> None:
+    """Stop ``unit`` and make systemd forget it.
+
+    An older proxy can take its full TimeoutStopSec (90s) to exit, so after
+    ``wait`` seconds it is killed.  A transient unit that stopped badly stays
+    loaded as failed, and a socket would start *it* rather than our unit file:
+    reset-failed unloads it.
+    """
+    run("stop", "--no-block", "--", unit)
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline and _state(run, unit) in ("active", "deactivating", "reloading"):
+        time.sleep(0.2)
+    if _state(run, unit) in ("active", "deactivating", "reloading"):
+        log.warning("%s did not stop within %gs; killing it", unit, wait)
+        run("kill", "--signal=SIGKILL", "--", unit)
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline and _state(run, unit) not in ("inactive", "failed", ""):
+            time.sleep(0.2)
+    run("reset-failed", "--", unit)
+
+
+def _state(run: Callable[..., subprocess.CompletedProcess], unit: str) -> str:
+    r = run("show", "-p", "ActiveState", "--value", "--", unit)
+    return r.stdout.strip()
+
+
 def install(cfg: Config, argv: list[str], tcp: bool = True, process_runner: bool = False,
             root: Path | None = None, run: Callable[..., subprocess.CompletedProcess] = systemctl) -> list[str]:  # fmt: skip
     """Write the units, take over from a transient proxy, enable and start them.  Idempotent.
@@ -140,8 +167,9 @@ def install(cfg: Config, argv: list[str], tcp: bool = True, process_runner: bool
         done.append(f"{'updated' if old else 'wrote'} {path}")
     if _transient(run, f"{PROXY}.service"):
         # A transient unit outranks unit files; it must go before ours can load.
-        run("stop", "--", f"{PROXY}.service")
+        _stop_transient(run, f"{PROXY}.service")
         done.append(f"stopped the transient {PROXY}.service")
+        changed.append(f"{PROXY}.service")
     if changed:
         _check(run("daemon-reload"), "daemon-reload")
     _check(run("enable", "--now", f"{PROXY}.socket"), f"enable {PROXY}.socket")

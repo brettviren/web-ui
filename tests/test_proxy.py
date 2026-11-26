@@ -73,7 +73,7 @@ def proxy(cfg):
     t.start()
     assert ready.wait(5)
     yield p
-    asyncio.run_coroutine_threadsafe(p.close(), loop).result(5)
+    asyncio.run_coroutine_threadsafe(p.close(1.0), loop).result(10)
     loop.call_soon_threadsafe(loop.stop)
     t.join(5)
 

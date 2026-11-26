@@ -8,7 +8,7 @@ import time
 import pytest
 
 from web_ui import config, systemd
-from web_ui.proxy import Proxy
+from web_ui.proxy import DRAIN, Proxy
 
 
 def free_port():
@@ -36,7 +36,9 @@ class FakeSystemctl:
     def __call__(self, *args):
         self.calls.append(args)
         out = ""
-        if args[0] == "show":
+        if args[0] == "show" and "--value" in args:
+            out = "active\n" if self.transient else "inactive\n"
+        elif args[0] == "show":
             out = f"Transient={'yes' if self.transient else 'no'}\nActiveState=active\n"
         if args[0] == "stop":
             self.transient = False
@@ -75,7 +77,44 @@ def test_install_takes_over_transient(cfg):
     run = FakeSystemctl(transient=True)
     done = systemd.install(cfg, ARGV, run=run)
     assert "stopped the transient web-ui-proxy.service" in done
-    assert run.verbs().index("stop") < run.verbs().index("daemon-reload")
+    v = run.verbs()
+    assert v.index("stop") < v.index("reset-failed") < v.index("daemon-reload")
+    assert "kill" not in v
+
+
+def test_install_kills_stuck_transient(cfg, monkeypatch):
+    """A transient proxy that ignores SIGTERM is killed, not waited on for 90s."""
+    monkeypatch.setattr(systemd.time, "sleep", lambda s: None)
+    t = iter(range(0, 1000, 5))
+    monkeypatch.setattr(systemd.time, "monotonic", lambda: next(t))
+    run = FakeSystemctl(transient=True)
+    real = run.__call__
+
+    def stuck(*args):
+        if args[0] == "stop":
+            run.calls.append(args)
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if args[0] == "kill":
+            run.transient = False
+        return real(*args)
+
+    systemd.install(cfg, ARGV, run=stuck)
+    v = run.verbs()
+    assert v.index("stop") < v.index("kill") < v.index("reset-failed") < v.index("daemon-reload")
+
+
+def test_close_with_idle_keepalive(cfg):
+    """An open, idle client connection (a browser tab) doesn't keep a stopping proxy alive."""
+
+    async def go():
+        p = Proxy(cfg)
+        await p.start()
+        _, w = await asyncio.open_connection("127.0.0.1", p.port)
+        await asyncio.sleep(0.1)  # accepted, and waiting for a request head
+        await asyncio.wait_for(p.close(), DRAIN + 2)
+        w.close()
+
+    asyncio.run(go())
 
 
 def test_install_refuses_foreign_file(cfg, env):

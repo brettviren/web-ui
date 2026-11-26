@@ -311,12 +311,16 @@ class Proxy:
             log.warning("config port is %s but systemd gave %s: run `web-ui install` to update the socket unit",
                         self.cfg.port, sorted(ports))  # fmt: skip
 
-    async def close(self) -> None:
+    async def close(self, grace: float = DRAIN) -> None:
+        """Stop accepting, let open connections finish (see :meth:`drain`), and release the listeners."""
         for srv in self.servers:
-            srv.close()
+            srv.close()  # with systemd's sockets, new connections now queue for the next proxy
+        await self.drain(grace)
         for srv in self.servers:
+            # Since Python 3.12 this also waits for every client connection, so it
+            # must come after drain (a browser's keep-alive would hold it forever).
             with contextlib.suppress(Exception):
-                await srv.wait_closed()
+                await asyncio.wait_for(srv.wait_closed(), 1.0)
         self.servers.clear()
         if not self.activated and not instances.probe(("unix", str(self.cfg.front_socket))):
             self.cfg.front_socket.unlink(missing_ok=True)  # systemd's socket stays for the next proxy
@@ -351,8 +355,7 @@ class Proxy:
             await stop.wait()
         finally:
             systemd.notify("STOPPING=1")
-            await self.close()  # stop accepting; with systemd's sockets, new connections queue
-            await self.drain()
+            await self.close()
 
     # ---- per connection -------------------------------------------------
 
