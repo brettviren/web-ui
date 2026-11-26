@@ -31,7 +31,8 @@ equivalent plain-ssh setup, if you prefer it to `web-ui tunnel`.
 ## Use
 
 ```sh
-web-ui serve --detach          # the front door on this machine (or: web-ui gen systemd)
+web-ui install                 # the front door on this machine, as a systemd user service
+# (or, without installing it: web-ui serve --detach)
 cd ~/proj/foo && web-ui up maggie
 #  → http://foo.maggie.hostA.localhost:8484/
 web-ui ls -a                   # instances here and on tunneled hosts
@@ -67,6 +68,16 @@ instances and hosts.  Usually you don't need to start anything by hand:
   port (routes by the host label).
 - **One SSH forward per remote host**: `hosts/<host>.sock` here → `front.sock`
   there (`web-ui tunnel`, or the stanza from `web-ui gen ssh-config`).
+- **Persistent proxy.**  `web-ui install` writes `web-ui-proxy.socket`,
+  `web-ui-proxy.service` and `web-ui-tunnel@.service` to
+  `~/.local/share/systemd/user` and starts them (safe to repeat; `web-ui
+  uninstall` undoes it).  systemd holds `front.sock` and the loopback port,
+  so the proxy starts at login (at boot with `loginctl enable-linger`), and
+  while it restarts new connections wait rather than fail; a stopping proxy
+  lets open requests finish for a few seconds.  It is `Type=notify`, and
+  `systemctl --user reload web-ui-proxy` re-reads the config.  Once
+  installed, `serve --detach` (and so a tunnel reviving a host) starts the
+  installed units instead of a transient copy.
 - **Processes** run as transient systemd user units (`systemd-run --user`,
   logs in the journal, sandboxing via `properties`) or, with
   `runner = "process"`, as detached children logging to

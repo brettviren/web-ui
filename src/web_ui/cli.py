@@ -14,7 +14,7 @@ from pathlib import Path
 
 import click
 
-from web_ui import __version__, instances, tunnel
+from web_ui import __version__, instances, systemd, tunnel
 from web_ui import config as config_mod
 from web_ui import log as log_mod
 from web_ui.config import Config, ConfigError
@@ -130,6 +130,15 @@ def _unmanaged(cfg: Config, service: str, what: str) -> None:
         raise click.ClickException(f"{service} is started outside web-ui (connect = {svc.connect!r}); {what} it there")
 
 
+def _wait_live(cfg: Config) -> None:
+    for _ in range(100):
+        if _proxy_live(cfg):
+            log.debug("detached proxy is live on %s", cfg.front_socket)
+            return
+        time.sleep(0.1)
+    raise click.ClickException("proxy did not start; see: web-ui logs and web-ui logs --proxy")
+
+
 def _proxy_live(cfg: Config) -> bool:
     return instances.probe(("unix", str(cfg.front_socket)))
 
@@ -153,6 +162,12 @@ def serve(obj: Ctx, port: int | None, no_tcp: bool, no_autostart: bool, detach: 
         if _proxy_live(cfg):
             log.debug("proxy already live on %s", cfg.front_socket)
             return
+        if systemd.installed():  # `web-ui install` was run here: start that, not a transient copy
+            r = systemd.systemctl("start", f"{PROXY_UNIT}.socket", f"{PROXY_UNIT}.service")
+            if r.returncode:
+                raise click.ClickException(f"systemctl --user start {PROXY_UNIT}: {(r.stderr or r.stdout).strip()}")
+            _wait_live(cfg)
+            return
         argv = [*obj.web_ui_argv(), "serve"]
         if port is not None:
             argv += ["--port", str(port)]
@@ -162,12 +177,8 @@ def serve(obj: Ctx, port: int | None, no_tcp: bool, no_autostart: bool, detach: 
             runner.start(Launch(unit=PROXY_UNIT, argv=argv, description="web-ui front-door proxy"))
         except RunnerError as e:
             raise _fail(e)
-        for _ in range(100):
-            if _proxy_live(cfg):
-                log.debug("detached proxy is live on %s", cfg.front_socket)
-                return
-            time.sleep(0.1)
-        raise click.ClickException("proxy did not start; see: web-ui logs and web-ui logs --proxy")
+        _wait_live(cfg)
+        return
     from web_ui import proxy
 
     try:
@@ -466,55 +477,19 @@ def gen_ssh_config(obj: Ctx) -> None:
     click.echo(tunnel.ssh_config_snippet(obj.cfg), nl=False)
 
 
-SYSTEMD_PROXY = """\
-[Unit]
-Description=web-ui front-door proxy
-
-[Service]
-ExecStart={exe} serve{args}
-ExecReload=kill -HUP $MAINPID
-Environment=PATH={path}
-Restart=on-failure
-
-[Install]
-WantedBy=default.target
-"""
-
-SYSTEMD_TUNNEL = """\
-[Unit]
-Description=web-ui tunnel to %i
-After=web-ui-proxy.service
-
-[Service]
-ExecStart={exe} tunnel --batch %i
-Environment=PATH={path}
-Restart=always
-RestartSec=15
-
-[Install]
-WantedBy=default.target
-"""
-
-
 @gen.command("systemd")
 @click.option("-o", "--output", type=click.Path(file_okay=False, path_type=Path),
               help="Write unit files here (e.g. ~/.config/systemd/user) instead of printing them.")  # fmt: skip
 @click.option("--no-tcp", is_flag=True, help="The proxy serves only its Unix socket (a host no browser sits at).")
 @pass_ctx
 def gen_systemd(obj: Ctx, output: Path | None, no_tcp: bool) -> None:
-    """User units: web-ui-proxy.service and web-ui-tunnel@.service.
+    """Print the user units `web-ui install` would write (or write them to --output).
 
-    Unneeded if you let the proxy start on demand ('serve --detach', which
-    'web-ui tunnel' runs on the remote) but useful with 'loginctl enable-linger'.
+    web-ui-proxy.socket (front.sock and the loopback port, held by systemd),
+    web-ui-proxy.service (Type=notify, socket-activated) and
+    web-ui-tunnel@.service.  `web-ui install` also enables and starts them.
     """
-    exe = f"{shlex.quote(sys.executable)} -m web_ui"
-    if obj.cfg_path:
-        exe += f" --config {shlex.quote(str(obj.cfg_path))}"
-    path = os.environ.get("PATH", "/usr/bin:/bin")
-    units = {
-        "web-ui-proxy.service": SYSTEMD_PROXY.format(exe=exe, path=path, args=" --no-tcp" if no_tcp else ""),
-        "web-ui-tunnel@.service": SYSTEMD_TUNNEL.format(exe=exe, path=path),
-    }
+    units = systemd.units(obj.cfg, obj.web_ui_argv(), tcp=not no_tcp, process_runner=_process_runner(obj.cfg))
     if output is None:
         for name, text in units.items():
             click.echo(f"# ---- {name}\n{text}")
@@ -523,7 +498,46 @@ def gen_systemd(obj: Ctx, output: Path | None, no_tcp: bool) -> None:
     for name, text in units.items():
         (output / name).write_text(text)
         click.echo(output / name)
-    click.echo("then: systemctl --user daemon-reload && systemctl --user enable --now web-ui-proxy.service", err=True)
+    click.echo(f"then: systemctl --user daemon-reload && systemctl --user enable --now {PROXY_UNIT}.socket", err=True)
+
+
+def _process_runner(cfg: Config) -> bool:
+    try:
+        return get_runner(cfg).name == "process"
+    except RunnerError:
+        return True
+
+
+@main.command("install")
+@click.option("--no-tcp", is_flag=True, help="The proxy serves only its Unix socket (a host no browser sits at).")
+@pass_ctx
+def install_cmd(obj: Ctx, no_tcp: bool) -> None:
+    """Run the proxy as a persistent systemd user service (safe to repeat).
+
+    Writes web-ui-proxy.socket, web-ui-proxy.service and web-ui-tunnel@.service
+    to ~/.local/share/systemd/user, replaces a transient proxy started by
+    `serve --detach`, and enables and starts them.  systemd then holds
+    front.sock and the loopback port: the proxy starts at login (at boot with
+    `loginctl enable-linger`), and while it restarts (`systemctl --user
+    restart web-ui-proxy`, or a changed unit) new connections wait rather
+    than fail.  Instances keep running across proxy restarts.
+    """
+    try:
+        done = systemd.install(obj.cfg, obj.web_ui_argv(), tcp=not no_tcp, process_runner=_process_runner(obj.cfg))
+    except RuntimeError as e:
+        raise _fail(e)
+    for line in done:
+        click.echo(line)
+    _wait_live(obj.cfg)
+    click.echo(f"{PROXY_UNIT} is running" + (f"; http://localhost:{obj.cfg.port}/" if obj.cfg.port and not no_tcp else ""))
+
+
+@main.command("uninstall")
+@pass_ctx
+def uninstall_cmd(obj: Ctx) -> None:
+    """Stop the installed proxy service and remove the units `web-ui install` wrote."""
+    for line in systemd.uninstall() or ["nothing installed"]:
+        click.echo(line)
 
 
 @main.command("config")

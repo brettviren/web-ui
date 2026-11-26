@@ -182,6 +182,22 @@ service supports them.
 | `~/.local/state/web-ui/web-ui.log` | web-ui's own log (default `-L` sink) |
 | `~/.local/state/web-ui/logs/` | output of background processes, with `runner = "process"` |
 
+## Running under systemd
+
+`web-ui install` makes the proxy a socket-activated user service:
+`web-ui-proxy.socket` listens on `front.sock` (mode 0600, in a 0700
+directory) and on the loopback port, and passes them to
+`web-ui-proxy.service` (`LISTEN_FDS`).  Because systemd owns the listening
+sockets, a restart (an upgrade, a changed unit) queues new connections
+instead of refusing them; the stopping proxy stops accepting, lets open
+connections finish for up to 5 s, then exits.  The service is `Type=notify`
+(READY=1 once it serves) and reloads its config on SIGHUP (`systemctl --user
+reload web-ui-proxy`).  Instances started by the systemd runner are
+separate transient units and keep running across proxy restarts; with the
+process runner they are the proxy's children, so the unit gets
+`KillMode=process`.  A changed `port` needs `web-ui install` again, to
+rewrite the socket unit.
+
 ## Limits
 
 - Nothing stops an idle instance: it runs until `web-ui down`.

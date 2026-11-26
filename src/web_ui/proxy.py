@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import signal
+import socket
 import subprocess
 import time
 from collections import defaultdict
@@ -36,7 +37,7 @@ from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
 from web_ui import config as config_mod
-from web_ui import instances, tunnel
+from web_ui import instances, systemd, tunnel
 from web_ui.config import Config, ConfigError, ensure_private_dir
 from web_ui.names import (
     DEFAULT_INSTANCE,
@@ -56,6 +57,7 @@ MAX_HEAD = 64 * 1024
 HEAD_TIMEOUT = 30.0
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-connection"}
+DRAIN = 5.0  # seconds a stopping proxy lets open connections finish
 
 
 def has_body(req: Request) -> bool:
@@ -223,6 +225,8 @@ class Proxy:
         self.uid = os.getuid()
         self.locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self.servers: list[asyncio.base_events.Server] = []
+        self.activated = False  # listening on sockets systemd holds (web-ui-proxy.socket)
+        self.active: set[asyncio.Task] = set()  # connections being handled
 
     # ---- config ---------------------------------------------------------
 
@@ -257,10 +261,15 @@ class Proxy:
 
     # ---- listening ------------------------------------------------------
 
-    async def start(self) -> None:
+    async def start(self, sockets: list | None = None) -> None:
+        """Listen: on ``sockets`` from systemd if given (else any it passed us), or bind our own."""
         cfg = self.cfg
         ensure_private_dir(cfg.runtime_dir)
         ensure_private_dir(cfg.hosts_dir)
+        sockets = systemd.listen_fds() if sockets is None else sockets
+        if sockets:
+            await self._start_activated(sockets)
+            return
         front = cfg.front_socket
         if instances.probe(("unix", str(front))):
             raise RuntimeError(f"a proxy is already listening on {front}")
@@ -284,6 +293,24 @@ class Proxy:
                 shown = f"[{addr}]" if ":" in addr else addr
                 log.info("listening on http://%s:%d (try http://localhost:%d/)", shown, self.port, self.port)
 
+    async def _start_activated(self, sockets: list) -> None:
+        """Serve on sockets systemd holds: the Unix one is the front door, TCP ones the loopback port."""
+        self.activated = True
+        ports = set()
+        for sock in sockets:
+            if sock.family == socket.AF_UNIX:
+                srv = await asyncio.start_unix_server(lambda r, w: self.handle(r, w, "unix"), sock=sock, limit=MAX_HEAD)
+                log.info("listening on %s (from systemd)", sock.getsockname())
+            else:
+                srv = await asyncio.start_server(lambda r, w: self.handle(r, w, "tcp"), sock=sock, limit=MAX_HEAD)
+                ports.add(sock.getsockname()[1])
+                log.info("listening on %s port %d (from systemd)", sock.getsockname()[0], sock.getsockname()[1])
+            self.servers.append(srv)
+        self.port = min(ports) if ports else 0
+        if self.port_from_config and ports and self.cfg.port not in ports:
+            log.warning("config port is %s but systemd gave %s: run `web-ui install` to update the socket unit",
+                        self.cfg.port, sorted(ports))  # fmt: skip
+
     async def close(self) -> None:
         for srv in self.servers:
             srv.close()
@@ -291,9 +318,20 @@ class Proxy:
             with contextlib.suppress(Exception):
                 await srv.wait_closed()
         self.servers.clear()
-        if not instances.probe(("unix", str(self.cfg.front_socket))):
-            self.cfg.front_socket.unlink(missing_ok=True)
+        if not self.activated and not instances.probe(("unix", str(self.cfg.front_socket))):
+            self.cfg.front_socket.unlink(missing_ok=True)  # systemd's socket stays for the next proxy
         log.info("stopped listening")
+
+    async def drain(self, grace: float = DRAIN) -> None:
+        """Wait up to ``grace`` seconds for connections being handled, then cut the rest."""
+        if not self.active:
+            return
+        log.info("letting %d connection(s) finish (up to %gs)", len(self.active), grace)
+        _, pending = await asyncio.wait(set(self.active), timeout=grace)
+        for task in pending:
+            task.cancel()
+        if pending:
+            log.info("cut %d connection(s) still open after %gs", len(pending), grace)
 
     async def serve_forever(self) -> None:
         await self.start()
@@ -308,14 +346,21 @@ class Proxy:
         loop.add_signal_handler(signal.SIGHUP, self.reload, True)
         log.debug("serving %s as uid %d: autostart=%s check_uid=%s strict_origin=%s",
                   self.cfg.hostname, self.uid, self.autostart, self.cfg.check_uid, self.cfg.strict_origin)  # fmt: skip
+        systemd.notify(f"READY=1\nSTATUS=serving {self.cfg.hostname}")
         try:
             await stop.wait()
         finally:
-            await self.close()
+            systemd.notify("STOPPING=1")
+            await self.close()  # stop accepting; with systemd's sockets, new connections queue
+            await self.drain()
 
     # ---- per connection -------------------------------------------------
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, kind: str) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            self.active.add(task)
+            task.add_done_callback(self.active.discard)
         acc = Access(kind)
         try:
             await self._handle(reader, writer, acc)
