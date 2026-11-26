@@ -90,7 +90,7 @@ forwards the request. Processes run as:
   `~/.local/state/web-ui/logs/`.
 
 A service can also be started by something else (syncthing, under
-supervisord). Its config gives a fixed `connect` address instead of a
+systemd). Its config gives a fixed `connect` address instead of a
 command: a Unix socket path, or a loopback port. web-ui routes to it while
 it is up, and never starts or stops it.
 

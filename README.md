@@ -143,12 +143,13 @@ See `examples/config.toml`.  `web-ui config` shows the effective settings and
 paths.  Command placeholders: `{socket} {port} {dir} {instance} {service}
 {host} {url} {runtime}`.
 
-A service that something else starts (supervisord, systemd, by hand) gets a
+A service that something else starts (systemd, by hand) gets a
 `connect` address instead of a `command`: `connect = "unix:~/path/gui.sock"`
 or `"127.0.0.1:8384"`.  It is a singleton, routed to while it is up, and
 never started or stopped by web-ui.  syncthing is the example: see
-`examples/config.toml` and `examples/supervisor.conf` for running its GUI on
-a Unix socket.
+`examples/config.toml` and the systemd drop-in
+`examples/syncthing.service.d/gui-socket.conf` for running its GUI on a Unix
+socket.
 
 ## Limits and next steps
 
