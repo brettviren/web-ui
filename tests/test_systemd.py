@@ -30,13 +30,15 @@ ARGV = ["/opt/web-ui/bin/python3", "-m", "web_ui", "--config", "/home/me/.config
 
 
 class FakeSystemctl:
-    def __init__(self, transient=False):
-        self.calls, self.transient = [], transient
+    def __init__(self, transient=False, fragment="/nonexistent/systemd/transient/web-ui-proxy.service"):
+        self.calls, self.transient, self.fragment = [], transient, fragment
 
     def __call__(self, *args):
         self.calls.append(args)
         out = ""
-        if args[0] == "show" and "--value" in args:
+        if args[0] == "show" and "FragmentPath" in args:
+            out = f"{self.fragment}\n" if self.transient else "\n"
+        elif args[0] == "show" and "--value" in args:
             out = "active\n" if self.transient else "inactive\n"
         elif args[0] == "show":
             out = f"Transient={'yes' if self.transient else 'no'}\nActiveState=active\n"
@@ -80,6 +82,20 @@ def test_install_takes_over_transient(cfg):
     v = run.verbs()
     assert v.index("stop") < v.index("reset-failed") < v.index("daemon-reload")
     assert "kill" not in v
+
+
+def test_install_takeover_stops_socket_and_drops_transient_file(cfg, env):
+    """Seen on hokum: a socket from an earlier install restarted the transient proxy on the next
+    connection, and systemd's transient file kept outranking ours across daemon-reload."""
+    frag = env / "run" / "systemd" / "transient" / "web-ui-proxy.service"
+    frag.parent.mkdir(parents=True)
+    frag.write_text("[Service]\nExecStart=/old\n")
+    run = FakeSystemctl(transient=True, fragment=str(frag))
+    systemd.install(cfg, ARGV, run=run)
+    assert ("stop", "--no-block", "--", "web-ui-proxy.socket", "web-ui-proxy.service") in run.calls
+    assert not frag.exists()
+    v = run.verbs()
+    assert v.index("reset-failed") < v.index("daemon-reload") < v.index("enable")
 
 
 def test_install_kills_stuck_transient(cfg, monkeypatch):

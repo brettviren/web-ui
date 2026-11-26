@@ -119,11 +119,15 @@ def _stop_transient(run: Callable[..., subprocess.CompletedProcess], unit: str, 
     """Stop ``unit`` and make systemd forget it.
 
     An older proxy can take its full TimeoutStopSec (90s) to exit, so after
-    ``wait`` seconds it is killed.  A transient unit that stopped badly stays
-    loaded as failed, and a socket would start *it* rather than our unit file:
-    reset-failed unloads it.
+    ``wait`` seconds it is killed.  Our socket, if an earlier install made it,
+    is stopped too: while it listens, the next connection would start the
+    transient unit again.  A transient unit stays loaded while failed, or
+    while the socket names it, and its file under .../systemd/transient
+    outranks ours even across daemon-reload; reset-failed and removing that
+    file (systemd's own copy, written by systemd-run) let ours load.
     """
-    run("stop", "--no-block", "--", unit)
+    fragment = run("show", "-p", "FragmentPath", "--value", "--", unit).stdout.strip()
+    run("stop", "--no-block", "--", f"{PROXY}.socket", unit)
     deadline = time.monotonic() + wait
     while time.monotonic() < deadline and _state(run, unit) in ("active", "deactivating", "reloading"):
         time.sleep(0.2)
@@ -134,6 +138,8 @@ def _stop_transient(run: Callable[..., subprocess.CompletedProcess], unit: str, 
         while time.monotonic() < deadline and _state(run, unit) not in ("inactive", "failed", ""):
             time.sleep(0.2)
     run("reset-failed", "--", unit)
+    if "/systemd/transient/" in fragment:
+        Path(fragment).unlink(missing_ok=True)
 
 
 def _state(run: Callable[..., subprocess.CompletedProcess], unit: str) -> str:
